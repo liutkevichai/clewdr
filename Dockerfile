@@ -52,6 +52,6 @@ ENV CLEWDR_AUTO_UPDATE=FALSE
 
 EXPOSE 8484
 
-RUN mkdir -p /app/data
+RUN mkdir -p /etc/clewdr
 // VOLUME [ "/etc/clewdr" ]
 CMD ["/usr/local/bin/clewdr", "--config", "/etc/clewdr/clewdr.toml", "--log-dir", "/etc/clewdr/log"]
