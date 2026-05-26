@@ -9,3 +9,6 @@ ENV CLEWDR_NO_FS=TRUE
 
 # Expose the port that Hugging Face expects
 EXPOSE ${PORT:-7860}
+
+ENV PNPM_CONFIG_AUTO_INSTALL_PEERS=true
+RUN pnpm config set auto-install-peers true
