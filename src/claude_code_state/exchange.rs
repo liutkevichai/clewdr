@@ -18,6 +18,7 @@ use serde_json::Value;
 use snafu::{OptionExt, ResultExt};
 use url::Url;
 
+use super::chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE};
 use crate::{
     claude_code_state::ClaudeCodeState,
     config::{
@@ -26,8 +27,6 @@ use crate::{
     },
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, UrlSnafu, WreqSnafu},
 };
-
-use super::chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE};
 
 type ClaudeOauthClient = Client<
     BasicErrorResponse,
@@ -161,9 +160,13 @@ impl ClaudeCodeState {
                 msg: "Failed to parse authorization response",
             })?;
 
-        let redirect_uri = redirect_json["redirect_uri"]
-            .as_str()
-            .expect("Expected redirect_uri in response");
+        let redirect_uri =
+            redirect_json["redirect_uri"]
+                .as_str()
+                .ok_or_else(|| ClewdrError::Whatever {
+                    message: format!("No reditect_uri found"),
+                    source: None,
+                })?;
         let redirect_url = Url::from_str(redirect_uri).context(UrlSnafu {
             url: redirect_uri.to_string(),
         })?;

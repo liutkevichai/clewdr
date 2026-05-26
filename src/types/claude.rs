@@ -1,7 +1,6 @@
-use serde::de;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
-use serde_with::{serde_as, DefaultOnError};
+use serde_with::{DefaultOnError, serde_as};
 use tiktoken_rs::o200k_base;
 
 #[derive(Debug)]
@@ -426,6 +425,8 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
     },
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 /// Source of an image
@@ -441,6 +442,59 @@ pub enum ImageSource {
     /// Uploaded file reference
     #[serde(rename = "file")]
     File { file_id: String },
+}
+
+impl ImageSource {
+    fn normalize_image_media_type(media_type: &str) -> Option<&'static str> {
+        match media_type.trim().to_lowercase().as_str() {
+            "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+            "image/png" => Some("image/png"),
+            "image/gif" => Some("image/gif"),
+            "image/webp" => Some("image/webp"),
+            _ => None,
+        }
+    }
+
+    /// Parse a data URI into an ImageSource
+    /// Supports format: data:<media_type>[;params];base64,<data>
+    /// e.g., data:image/png;base64,iVBORw0KGgo...
+    /// e.g., data:image/png;name=foo;base64,iVBORw0KGgo...
+    pub fn from_data_url(url: &str) -> Option<Self> {
+        let url = url.trim();
+        let (metadata, base64_data) = url.split_once(',')?;
+        // reject empty data
+        if base64_data.is_empty() {
+            return None;
+        }
+        if metadata.len() < 5 || !metadata[..5].eq_ignore_ascii_case("data:") {
+            return None;
+        }
+        let after_data = &metadata[5..];
+        let mut parts = after_data.split(';');
+        let media_type = Self::normalize_image_media_type(parts.next()?)?;
+        if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+            return None;
+        }
+
+        Some(Self::Base64 {
+            media_type: media_type.to_string(),
+            data: base64_data.to_owned(),
+        })
+    }
+
+    /// Parse an OpenAI-compatible image URL into an ImageSource.
+    pub fn from_image_url(url: &str) -> Option<Self> {
+        let url = url.trim();
+        Self::from_data_url(url).or_else(|| {
+            if url.starts_with("https://") || url.starts_with("http://") {
+                Some(Self::Url {
+                    url: url.to_string(),
+                })
+            } else {
+                None
+            }
+        })
+    }
 }
 
 // oai image
@@ -969,8 +1023,9 @@ pub struct StreamError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn deserializes_claude_code_builtin_tools_without_input_schema() {

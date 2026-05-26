@@ -45,10 +45,13 @@ impl ClaudeWebState {
 
             let cookie = state.request_cookie().await?;
             // check if request is successful
-            let web_res = async { state.bootstrap().await.and(state.send_chat(p).await) };
+            let web_res = async {
+                state.bootstrap().await?;
+                state.send_chat(p).await
+            };
             let transform_res = web_res
                 .and_then(async |r| self.transform_response(r).await)
-                .instrument(info_span!("claude_web", "cookie" = cookie.cookie.ellipse()));
+                .instrument(info_span!("claude_web", "cookie" = cookie.cookie.mask()));
 
             match transform_res.await {
                 Ok(b) => {
@@ -103,7 +106,10 @@ impl ClaudeWebState {
                 "api/organizations/{}/chat_conversations",
                 org_uuid
             ))
-            .expect("Url parse error");
+            .map_err(|e| ClewdrError::Whatever {
+                message: format!("Parse URL error: {e}"),
+                source: Some(Box::new(e)),
+            })?;
         let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         let body = json!({
             "uuid": new_uuid,
@@ -152,7 +158,10 @@ impl ClaudeWebState {
                 "api/organizations/{}/chat_conversations/{}",
                 org_uuid, new_uuid
             ))
-            .expect("Url parse error");
+            .map_err(|e| ClewdrError::Whatever {
+                message: format!("Parse URL error: {e}"),
+                source: Some(Box::new(e)),
+            })?;
         let _ = self
             .build_request(Method::PUT, endpoint)
             .json(&body)

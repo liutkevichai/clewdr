@@ -68,12 +68,6 @@ pub async fn api_post_cookie(
         return Err(ApiError::unauthorized());
     }
     c.reset_time = None;
-    if c.supports_claude_1m_sonnet.is_none() {
-        c.supports_claude_1m_sonnet = Some(true);
-    }
-    if c.supports_claude_1m_opus.is_none() {
-        c.supports_claude_1m_opus = Some(true);
-    }
     info!("Cookie accepted: {}", c.cookie);
     match s.submit(c).await {
         Ok(_) => {
@@ -87,40 +81,6 @@ pub async fn api_post_cookie(
             error!("Failed to submit cookie: {}", e);
             Err(ApiError::internal(format!(
                 "Failed to submit cookie: {}",
-                e
-            )))
-        }
-    }
-}
-
-/// API endpoint to update per-cookie 1M support settings
-/// Only updates supports_claude_1m_sonnet / supports_claude_1m_opus on existing cookies
-pub async fn api_put_cookie(
-    State(s): State<CookieActorHandle>,
-    AuthBearer(t): AuthBearer,
-    Json(mut c): Json<CookieStatus>,
-) -> Result<StatusCode, ApiError> {
-    if !CLEWDR_CONFIG.load().admin_auth(&t) {
-        return Err(ApiError::unauthorized());
-    }
-    if c.supports_claude_1m_sonnet.is_none() {
-        c.supports_claude_1m_sonnet = Some(true);
-    }
-    if c.supports_claude_1m_opus.is_none() {
-        c.supports_claude_1m_opus = Some(true);
-    }
-
-    match s.update_cookie_1m_support(c.clone()).await {
-        Ok(_) => {
-            info!("Cookie 1M flags updated: {}", c.cookie);
-            COOKIES_CACHE.invalidate(COOKIE_STATUS_CACHE_KEY);
-            info!("Cookie status cache invalidated after cookie update");
-            Ok(StatusCode::OK)
-        }
-        Err(e) => {
-            error!("Failed to update cookie 1M flags: {}", e);
-            Err(ApiError::bad_request(format!(
-                "Failed to update cookie 1M flags: {}",
                 e
             )))
         }
@@ -346,8 +306,6 @@ async fn augment_utilization(cookies: Vec<CookieStatus>, handle: CookieActorHand
                     five_reset,
                     seven_day,
                     seven_reset,
-                    seven_day_opus,
-                    opus_reset,
                     seven_day_sonnet,
                     sonnet_reset,
                 )) => {
@@ -356,8 +314,6 @@ async fn augment_utilization(cookies: Vec<CookieStatus>, handle: CookieActorHand
                     obj["session_resets_at"] = json!(five_reset);
                     obj["seven_day_utilization"] = json!(seven_day);
                     obj["seven_day_resets_at"] = json!(seven_reset);
-                    obj["seven_day_opus_utilization"] = json!(seven_day_opus);
-                    obj["seven_day_opus_resets_at"] = json!(opus_reset);
                     obj["seven_day_sonnet_utilization"] = json!(seven_day_sonnet);
                     obj["seven_day_sonnet_resets_at"] = json!(sonnet_reset);
                     obj
@@ -375,8 +331,6 @@ async fn fetch_usage_percent(
     cookie: CookieStatus,
     handle: CookieActorHandle,
 ) -> Option<(
-    u32,
-    Option<String>,
     u32,
     Option<String>,
     u32,
@@ -426,19 +380,16 @@ async fn try_oauth_usage(
         .map_err(|_| ())
 }
 
-/// Extract the eight usage fields from the usage JSON returned by either endpoint
-fn extract_usage_fields(
-    usage: &serde_json::Value,
-) -> Option<(
+type Usage = Option<(
     u32,
     Option<String>,
     u32,
     Option<String>,
     u32,
     Option<String>,
-    u32,
-    Option<String>,
-)> {
+)>;
+/// Extract the six usage fields from the usage JSON returned by either endpoint
+fn extract_usage_fields(usage: &serde_json::Value) -> Usage {
     let five = usage
         .get("five_hour")
         .and_then(|o| o.get("utilization"))
@@ -461,17 +412,6 @@ fn extract_usage_fields(
         .and_then(|o| o.get("resets_at"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let seven_opus = usage
-        .get("seven_day_opus")
-        .and_then(|o| o.get("utilization"))
-        .and_then(|v| v.as_f64())
-        .map(|v| v.round() as u32)
-        .unwrap_or(0);
-    let opus_reset = usage
-        .get("seven_day_opus")
-        .and_then(|o| o.get("resets_at"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
     let seven_sonnet = usage
         .get("seven_day_sonnet")
         .and_then(|o| o.get("utilization"))
@@ -488,8 +428,6 @@ fn extract_usage_fields(
         five_reset,
         seven,
         seven_reset,
-        seven_opus,
-        opus_reset,
         seven_sonnet,
         sonnet_reset,
     ))

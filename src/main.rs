@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use clewdr::{
     self, FIG, IS_DEBUG,
     config::{CLEWDR_CONFIG, CONFIG_PATH, LOG_DIR},
@@ -5,9 +7,7 @@ use clewdr::{
     version_info_colored,
 };
 use colored::Colorize;
-#[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
-use std::io::IsTerminal;
 use tracing::Subscriber;
 use tracing_subscriber::{
     Layer, Registry,
@@ -16,12 +16,8 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
 
 fn setup_subscriber<S>(subscriber: S)
 where
@@ -61,8 +57,6 @@ async fn main() -> Result<(), ClewdrError> {
         .install_default()
         .expect("failed to install aws-lc crypto provider");
 
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
     #[cfg(windows)]
     {
         _ = enable_ansi_support::enable_ansi_support();
@@ -88,6 +82,7 @@ async fn main() -> Result<(), ClewdrError> {
             .with_writer(std::io::stdout)
             .with_timer(timer.to_owned())
             .with_ansi(stdout_is_tty)
+            .with_ansi_sanitization(false)
             .with_filter(env_filter),
     );
     let _guard = if !CLEWDR_CONFIG.load().no_fs && CLEWDR_CONFIG.load().log_to_file {
