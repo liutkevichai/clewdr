@@ -69,11 +69,5 @@ ENV CLEWDR_IP=0.0.0.0
 ENV CLEWDR_PORT=8484
 ENV CLEWDR_CHECK_UPDATE=FALSE
 ENV CLEWDR_AUTO_UPDATE=FALSE
-
 EXPOSE 8484
-
-RUN mkdir -p /etc/clewdr
 CMD ["/usr/local/bin/clewdr", "--config", "/etc/clewdr/clewdr.toml", "--log-dir", "/etc/clewdr/log"]
-
-ENV PNPM_CONFIG_AUTO_INSTALL_PEERS=true
-RUN pnpm config set auto-install-peers true
