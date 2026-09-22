@@ -1,3 +1,4 @@
+use anthropic_wire::CreateMessageParams;
 use colored::Colorize;
 use futures::TryFutureExt;
 use serde_json::json;
@@ -9,7 +10,6 @@ use super::ClaudeWebState;
 use crate::{
     config::CLEWDR_CONFIG,
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
-    types::claude::CreateMessageParams,
     utils::print_out_json,
 };
 
@@ -32,18 +32,22 @@ impl ClaudeWebState {
     ///
     /// # Returns
     /// * `Result<axum::response::Response, ClewdrError>` - Formatted response or error
+    ///
+    /// # Errors
+    /// [`ClewdrError::TooManyRetries`] once `max_retries` attempts have all
+    /// failed, or any non-retryable error from the attempt itself.
     pub async fn try_chat(
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
-        for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
+        for i in 0..=CLEWDR_CONFIG.load().max_retries {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
             }
             let mut state = self.to_owned();
-            let p = p.to_owned();
+            let p = p.clone();
 
-            let cookie = state.request_cookie().await?;
+            let cookie = state.request_cookie()?;
             // check if request is successful
             let web_res = async {
                 state.bootstrap().await?;
@@ -61,7 +65,7 @@ impl ClaudeWebState {
                     error!("{e}");
                     // 429 error
                     if let ClewdrError::InvalidCookie { reason } = e {
-                        state.return_cookie(Some(reason.to_owned())).await;
+                        state.return_cookie(Some(reason.clone()));
                         continue;
                     }
                     return Err(e);
@@ -91,21 +95,15 @@ impl ClaudeWebState {
     /// # Returns
     /// * `Result<Response, ClewdrError>` - Response from Claude or error
     async fn send_chat(&mut self, p: CreateMessageParams) -> Result<Response, ClewdrError> {
-        let org_uuid = self
-            .org_uuid
-            .to_owned()
-            .ok_or(ClewdrError::UnexpectedNone {
-                msg: "Organization UUID is not set",
-            })?;
+        let org_uuid = self.org_uuid.clone().ok_or(ClewdrError::UnexpectedNone {
+            msg: "Organization UUID is not set",
+        })?;
 
         // Create a new conversation
         let new_uuid = uuid::Uuid::new_v4().to_string();
         let endpoint = self
             .endpoint
-            .join(&format!(
-                "api/organizations/{}/chat_conversations",
-                org_uuid
-            ))
+            .join(&format!("api/organizations/{org_uuid}/chat_conversations"))
             .map_err(|e| ClewdrError::Whatever {
                 message: format!("Parse URL error: {e}"),
                 source: Some(Box::new(e)),
@@ -113,23 +111,23 @@ impl ClaudeWebState {
         let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         let body = json!({
             "uuid": new_uuid,
-            "name": if is_temporary { "".to_string() } else { format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")) },
+            "name": if is_temporary { String::new() } else { format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")) },
             "is_temporary": is_temporary,
         });
 
         let referer = if is_temporary {
-            self.endpoint
-                .join("new?incognito")
-                .map(|u| u.to_string())
-                .unwrap_or_else(|_| format!("{}new?incognito", crate::config::CLAUDE_ENDPOINT))
+            self.endpoint.join("new?incognito").map_or_else(
+                |_| format!("{}new?incognito", crate::config::CLAUDE_ENDPOINT),
+                |u| u.to_string(),
+            )
         } else {
-            self.endpoint
-                .join("new")
-                .map(|u| u.to_string())
-                .unwrap_or_else(|_| format!("{}new", crate::config::CLAUDE_ENDPOINT))
+            self.endpoint.join("new").map_or_else(
+                |_| format!("{}new", crate::config::CLAUDE_ENDPOINT),
+                |u| u.to_string(),
+            )
         };
 
-        self.build_request(Method::POST, endpoint)
+        self.build_request(Method::POST, &endpoint)
             .header(wreq::header::REFERER, referer)
             .json(&body)
             .send()
@@ -139,7 +137,7 @@ impl ClaudeWebState {
             })?
             .check_claude()
             .await?;
-        self.conv_uuid = Some(new_uuid.to_string());
+        self.conv_uuid = Some(new_uuid.clone());
         debug!("New conversation created: {}", new_uuid);
 
         // preserve original params for possible post-call token accounting
@@ -155,15 +153,14 @@ impl ClaudeWebState {
         let endpoint = self
             .endpoint
             .join(&format!(
-                "api/organizations/{}/chat_conversations/{}",
-                org_uuid, new_uuid
+                "api/organizations/{org_uuid}/chat_conversations/{new_uuid}"
             ))
             .map_err(|e| ClewdrError::Whatever {
                 message: format!("Parse URL error: {e}"),
                 source: Some(Box::new(e)),
             })?;
         let _ = self
-            .build_request(Method::PUT, endpoint)
+            .build_request(Method::PUT, &endpoint)
             .json(&body)
             .send()
             .await;
@@ -174,7 +171,7 @@ impl ClaudeWebState {
         })?;
 
         // check images
-        let images = body.images.drain(..).collect::<Vec<_>>();
+        let images = std::mem::take(&mut body.images);
 
         // upload images
         let files = self.upload_images(images).await;
@@ -185,12 +182,11 @@ impl ClaudeWebState {
         let endpoint = self
             .endpoint
             .join(&format!(
-                "api/organizations/{}/chat_conversations/{}/completion",
-                org_uuid, new_uuid
+                "api/organizations/{org_uuid}/chat_conversations/{new_uuid}/completion"
             ))
             .expect("Url parse error");
 
-        self.build_request(Method::POST, endpoint)
+        self.build_request(Method::POST, &endpoint)
             .json(&body)
             .header(ACCEPT, "text/event-stream")
             .send()

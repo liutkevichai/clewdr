@@ -1,9 +1,8 @@
+use anthropic_wire::{ContentBlockDelta, CreateMessageResponse, StopReason, StreamEvent};
 use axum::response::sse::Event;
 use futures::{Stream, TryStreamExt};
 use serde::Serialize;
 use serde_json::Value;
-
-use crate::types::claude::{ContentBlockDelta, CreateMessageResponse, StreamEvent};
 
 /// Represents the data structure for streaming events in OpenAI API format
 /// Contains a choices array with deltas of content
@@ -13,13 +12,13 @@ struct StreamEventData {
 }
 
 impl StreamEventData {
-    /// Creates a new StreamEventData with the given content
+    /// Creates a new `StreamEventData` with the given content
     ///
     /// # Arguments
     /// * `content` - The event content to include
     ///
     /// # Returns
-    /// A new StreamEventData instance with the content wrapped in choices array
+    /// A new `StreamEventData` instance with the content wrapped in choices array
     fn new(content: EventContent) -> Self {
         Self {
             choices: vec![StreamEventDelta { delta: content }],
@@ -96,12 +95,12 @@ where
     })
 }
 
-pub fn transforms_json(input: CreateMessageResponse) -> Value {
+pub fn transforms_json(input: &CreateMessageResponse) -> Value {
     let content = input
         .content
         .iter()
         .filter_map(|block| match block {
-            crate::types::claude::ContentBlock::Text { text, .. } => Some(text.clone()),
+            anthropic_wire::ContentBlock::Text { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect::<String>();
@@ -115,14 +114,12 @@ pub fn transforms_json(input: CreateMessageResponse) -> Value {
     });
 
     let finish_reason = match input.stop_reason {
-        Some(crate::types::claude::StopReason::EndTurn) => "stop",
-        Some(crate::types::claude::StopReason::MaxTokens) => "length",
-        Some(crate::types::claude::StopReason::StopSequence) => "stop",
-        Some(crate::types::claude::StopReason::ToolUse) => "tool_calls",
-        Some(crate::types::claude::StopReason::PauseTurn) => "stop",
-        Some(crate::types::claude::StopReason::Refusal) => "content_filter",
-        Some(crate::types::claude::StopReason::ModelContextWindowExceeded) => "length",
-        None => "stop",
+        Some(StopReason::MaxTokens | StopReason::ModelContextWindowExceeded) => "length",
+        Some(StopReason::ToolUse) => "tool_calls",
+        Some(StopReason::Refusal) => "content_filter",
+        Some(StopReason::EndTurn | StopReason::StopSequence | StopReason::PauseTurn) | None => {
+            "stop"
+        }
     };
 
     serde_json::json!({

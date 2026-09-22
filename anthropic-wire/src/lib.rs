@@ -1,7 +1,62 @@
-use serde::{Deserialize, Serialize, de};
+//! Anthropic Messages API wire format.
+//!
+//! These types exist to sit in the middle of a conversation between someone
+//! else's client and Anthropic, which makes them stricter about round-tripping
+//! than a client SDK needs to be:
+//!
+//! - Shapes we do not recognise survive. [`ContentBlock::Unknown`],
+//!   [`Tool::Raw`] and the `extra` maps on [`CustomTool`]/[`KnownTool`] keep
+//!   unmodelled JSON so a request can be forwarded unchanged.
+//! - Fields that are only hints degrade instead of failing. An unparseable
+//!   `thinking` yields `None` rather than rejecting the whole request.
+//! - Every type is both [`Serialize`] and [`Deserialize`], because a proxy
+//!   both reads and writes each side of the exchange.
+//!
+//! Nothing here knows about accounts, transport or routing; that all lives in
+//! clewdr proper.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
-use serde_with::{DefaultOnError, serde_as};
-use tiktoken_rs::o200k_base;
+#[cfg(feature = "token-count")]
+use tiktoken_rs::o200k_base_singleton;
+
+/// Deserialize `Option<Option<T>>` so that an absent field and an explicit
+/// `null` stay distinguishable.
+///
+/// Plain `Option<Option<T>>` collapses both to the outer `None`, because serde
+/// resolves `null` at the outermost layer. Anything whose schema gives `null`
+/// its own meaning -- `diagnostics.previous_message_id` opts in while saying
+/// there is no prior turn -- needs this to survive a round trip.
+// clippy::option_option suggests collapsing to `Option<T>`, or a custom enum
+// if all three states are needed. They are: absent, null and present are three
+// different requests here, and `Option<Option<T>>` is the shape serde's
+// `skip_serializing_if` and `default` already understand. A bespoke enum would
+// need hand-written impls on both sides to express the same thing.
+#[allow(clippy::option_option, reason = "absent and null differ on the wire")]
+fn absent_or_null<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
+/// Deserialize a field, falling back to `None` when it does not parse.
+///
+/// `thinking` is an optional hint, so a client that sends a shape we do not
+/// recognise should still get an answer instead of a 422 for the whole request.
+fn none_on_error<'de, T, D>(de: D) -> Result<Option<T>, D::Error>
+where
+    T: de::DeserializeOwned,
+    D: Deserializer<'de>,
+{
+    // Buffered through Value because a failed `T` leaves the deserializer
+    // mid-value, with no way to skip the rest of it.
+    let value = Value::deserialize(de)?;
+    Ok(serde_json::from_value(value).unwrap_or(None))
+}
 
 #[derive(Debug)]
 pub struct RequiredMessageParams {
@@ -10,7 +65,8 @@ pub struct RequiredMessageParams {
     pub max_tokens: u32,
 }
 
-pub(super) fn default_max_tokens() -> u32 {
+#[must_use]
+pub fn default_max_tokens() -> u32 {
     8192
 }
 
@@ -22,12 +78,18 @@ pub struct OutputConfig {
     pub format: Option<OutputFormat>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// Effort rungs, ordered from cheapest to most capable.
+///
+/// `xhigh` sits between `high` and `max` and only exists from Claude 4.7 on.
+/// Which models accept which rungs is a routing concern, so it is not decided
+/// here.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputEffort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -57,7 +119,6 @@ pub struct McpServer {
     pub tool_configuration: Option<serde_json::Value>,
 }
 /// Parameters for creating a message
-#[serde_as]
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct CreateMessageParams {
     /// Maximum number of tokens to generate
@@ -89,8 +150,7 @@ pub struct CreateMessageParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     /// Thinking mode configuration
-    #[serde(default)]
-    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default, deserialize_with = "none_on_error")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Thinking>,
     /// Top-k sampling
@@ -117,16 +177,136 @@ pub struct CreateMessageParams {
     /// Service tier selection
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
-    /// Number of completions to generate
+    /// Number of completions to generate.
+    ///
+    /// Not an Anthropic field -- it arrives from OpenAI-shaped clients and is
+    /// carried here by the conversion in clewdr's `types::oai`. Anthropic
+    /// ignores it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
+    /// Caches the whole request prefix, as opposed to the per-block
+    /// `cache_control` that appears on content blocks and tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    /// Geographic preference for where inference runs. Free-form: the accepted
+    /// values are a deployment concern and change without touching the schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_geo: Option<String>,
+    /// Latency/quality preference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
+    /// Opts into prompt-cache diagnostics on the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<DiagnosticsParam>,
+    /// Models to try if the primary one refuses or is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<FallbacksParam>,
+    /// Redeems a credit token from a previous refusal's `stop_details`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_credit_token: Option<FallbackCreditToken>,
 }
 
+/// Latency/quality preference on a request.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Speed {
+    Standard,
+    Fast,
+}
+
+/// Opts into prompt-cache diagnostics, reported back under
+/// `diagnostics.cache_miss_reason`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct DiagnosticsParam {
+    /// The `msg_...` id from this client's previous response, whose prompt
+    /// fingerprint the server compares against this request.
+    ///
+    /// An explicit `null` means "opt in, but there is no previous turn to
+    /// compare", which is distinct from omitting the field, hence the nesting:
+    /// the outer `Option` is presence, the inner one is the JSON null.
+    #[serde(default, deserialize_with = "absent_or_null")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(clippy::option_option, reason = "absent and null differ on the wire")]
+    pub previous_message_id: Option<Option<String>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Either Anthropic's own fallback selection or an explicit chain.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum FallbacksParam {
+    /// The literal string `"default"`.
+    Default(FallbacksDefault),
+    /// Tried in order.
+    Models(Vec<FallbackParam>),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FallbacksDefault {
+    Default,
+}
+
+/// One entry in a fallback chain. Every field other than `model` overrides the
+/// top-level request for this attempt only.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FallbackParam {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
+    /// Same degrade-instead-of-reject treatment as the top-level `thinking`.
+    #[serde(default, deserialize_with = "none_on_error")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Thinking>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Accepts both the bare token and the object form, which the API documents as
+/// carrying the same string.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum FallbackCreditToken {
+    Token(String),
+    Config(FallbackCreditTokenConfig),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct FallbackCreditTokenConfig {
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<FallbackCreditMode>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackCreditMode {
+    Strict,
+    BestEffort,
+}
+
+#[cfg(feature = "token-count")]
 impl CreateMessageParams {
+    /// Estimate the prompt's token count with the `o200k_base` encoding.
+    ///
+    /// This is an approximation: Anthropic does not publish its tokenizer, so
+    /// the count only informs local accounting.
+    ///
+    /// The encoder is a process-wide singleton. Building one takes ~60ms
+    /// against ~0.04ms to encode a typical message, so constructing it per
+    /// call put the entire cost in the wrong place.
+    #[must_use]
     pub fn count_tokens(&self) -> u32 {
-        let bpe = o200k_base().expect("Failed to get encoding");
+        let bpe = o200k_base_singleton();
         let systems = match self.system {
-            Some(Value::String(ref s)) => s.to_string(),
+            Some(Value::String(ref s)) => s.clone(),
             Some(Value::Array(ref arr)) => arr.iter().filter_map(|v| v["text"].as_str()).collect(),
             _ => String::new(),
         };
@@ -134,7 +314,7 @@ impl CreateMessageParams {
             .messages
             .iter()
             .map(|msg| match msg.content {
-                MessageContent::Text { ref content } => content.to_string(),
+                MessageContent::Text { ref content } => content.clone(),
                 MessageContent::Blocks { ref content } => content
                     .iter()
                     .map(|block| match block {
@@ -145,8 +325,11 @@ impl CreateMessageParams {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        bpe.encode_with_special_tokens(&systems).len() as u32
-            + bpe.encode_with_special_tokens(&messages).len() as u32
+        let systems =
+            u32::try_from(bpe.encode_with_special_tokens(&systems).len()).unwrap_or(u32::MAX);
+        let messages =
+            u32::try_from(bpe.encode_with_special_tokens(&messages).len()).unwrap_or(u32::MAX);
+        systems.saturating_add(messages)
     }
 }
 
@@ -154,14 +337,32 @@ impl CreateMessageParams {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Thinking {
-    Enabled { budget_tokens: u64 },
+    Enabled {
+        budget_tokens: u64,
+    },
     Disabled,
-    Adaptive,
+    Adaptive {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
+    },
 }
 
 impl Thinking {
+    /// Legacy extended thinking with an explicit budget.
+    #[must_use]
     pub fn new(budget_tokens: u64) -> Self {
         Self::Enabled { budget_tokens }
+    }
+
+    /// Adaptive thinking with the reasoning summary returned to the client.
+    ///
+    /// `display` defaults to `omitted` on the newest models, so it has to be
+    /// requested explicitly for the client to see any thinking text.
+    #[must_use]
+    pub fn adaptive_summarized() -> Self {
+        Self::Adaptive {
+            display: Some("summarized".to_string()),
+        }
     }
 }
 
@@ -178,51 +379,61 @@ impl From<RequiredMessageParams> for CreateMessageParams {
 
 impl CreateMessageParams {
     /// Create new parameters with only required fields
+    #[must_use]
     pub fn new(required: RequiredMessageParams) -> Self {
         required.into()
     }
 
     // Builder methods for optional parameters
+    #[must_use]
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(serde_json::json!(system.into()));
         self
     }
 
+    #[must_use]
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
 
+    #[must_use]
     pub fn with_stop_sequences(mut self, stop_sequences: Vec<String>) -> Self {
         self.stop_sequences = Some(stop_sequences);
         self
     }
 
+    #[must_use]
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = Some(stream);
         self
     }
 
+    #[must_use]
     pub fn with_top_k(mut self, top_k: u32) -> Self {
         self.top_k = Some(top_k);
         self
     }
 
+    #[must_use]
     pub fn with_top_p(mut self, top_p: f32) -> Self {
         self.top_p = Some(top_p);
         self
     }
 
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
         self.tools = Some(tools);
         self
     }
 
+    #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
     }
 
+    #[must_use]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
@@ -455,10 +666,15 @@ impl ImageSource {
         }
     }
 
-    /// Parse a data URI into an ImageSource
-    /// Supports format: data:<media_type>[;params];base64,<data>
-    /// e.g., data:image/png;base64,iVBORw0KGgo...
-    /// e.g., data:image/png;name=foo;base64,iVBORw0KGgo...
+    /// Parse a data URI into an `ImageSource`.
+    ///
+    /// Accepts `data:<media_type>[;params];base64,<data>`, for example:
+    ///
+    /// ```text
+    /// data:image/png;base64,iVBORw0KGgo...
+    /// data:image/png;name=foo;base64,iVBORw0KGgo...
+    /// ```
+    #[must_use]
     pub fn from_data_url(url: &str) -> Option<Self> {
         let url = url.trim();
         let (metadata, base64_data) = url.split_once(',')?;
@@ -482,7 +698,8 @@ impl ImageSource {
         })
     }
 
-    /// Parse an OpenAI-compatible image URL into an ImageSource.
+    /// Parse an OpenAI-compatible image URL into an `ImageSource`.
+    #[must_use]
     pub fn from_image_url(url: &str) -> Option<Self> {
         let url = url.trim();
         Self::from_data_url(url).or_else(|| {
@@ -818,9 +1035,19 @@ pub struct CreateMessageResponse {
     pub usage: Option<Usage>,
 }
 
+#[cfg(feature = "token-count")]
 impl CreateMessageResponse {
+    /// Estimate the response's token count with the `o200k_base` encoding.
+    ///
+    /// This is an approximation: Anthropic does not publish its tokenizer, so
+    /// the count only informs local accounting.
+    ///
+    /// The encoder is a process-wide singleton. Building one takes ~60ms
+    /// against ~0.04ms to encode a typical message, so constructing it per
+    /// call put the entire cost in the wrong place.
+    #[must_use]
     pub fn count_tokens(&self) -> u32 {
-        let bpe = o200k_base().expect("Failed to get encoding");
+        let bpe = o200k_base_singleton();
         let content = self
             .content
             .iter()
@@ -830,17 +1057,18 @@ impl CreateMessageResponse {
                     source: ImageSource::Base64 { data, .. },
                     ..
                 } => data.as_str(),
-                ContentBlock::Image { .. } => "",
+                // Non-base64 images and every other block contribute no text.
                 _ => "",
             })
             .collect::<Vec<_>>()
             .join("\n");
-        bpe.encode_with_special_tokens(&content).len() as u32
+        u32::try_from(bpe.encode_with_special_tokens(&content).len()).unwrap_or(u32::MAX)
     }
 }
 
 impl CreateMessageResponse {
     /// Create a new response with the given content blocks
+    #[must_use]
     pub fn text(content: String, model: String, usage: Usage) -> Self {
         Self {
             content: vec![ContentBlock::text(content)],
@@ -898,6 +1126,7 @@ impl Message {
     }
 
     /// Create a new message with content blocks
+    #[must_use]
     pub fn new_blocks(role: Role, blocks: Vec<ContentBlock>) -> Self {
         Self {
             role,
@@ -1006,6 +1235,23 @@ pub enum ContentBlockDelta {
     ThinkingDelta { thinking: String },
     #[serde(rename = "signature_delta")]
     SignatureDelta { signature: String },
+    /// Emitted while citations are enabled. `citation` is left as raw JSON:
+    /// there are six location shapes, none of which this crate inspects, and
+    /// modelling them would be six more things to keep in step with the API
+    /// for no gain over passing them through.
+    #[serde(rename = "citations_delta")]
+    CitationsDelta { citation: serde_json::Value },
+    /// Emitted when the server compacts context mid-response.
+    #[serde(rename = "compaction_delta")]
+    CompactionDelta {
+        content: Option<String>,
+        encrypted_content: Option<String>,
+    },
+    /// Anything newer than this crate. A delta arrives mid-response, after
+    /// headers and earlier events are already on the wire, so refusing to
+    /// parse one is not a recoverable error -- keep it as JSON and forward it.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -1026,6 +1272,181 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// `thinking` is an optional hint. A client sending a shape we do not
+    /// recognise should still get an answer, so it degrades to `None` instead
+    /// of failing the whole request.
+    #[test]
+    fn an_unrecognised_thinking_value_degrades_to_none() {
+        for bad in [
+            json!("enabled"),
+            json!(42),
+            json!({ "type": "no_such_mode" }),
+            json!({ "type": "enabled" }),
+            json!([]),
+        ] {
+            let body = json!({
+                "max_tokens": 1024,
+                "messages": [{ "role": "user", "content": "hi" }],
+                "model": "claude-sonnet-4-20250514",
+                "thinking": bad,
+            });
+
+            let parsed: CreateMessageParams = serde_json::from_value(body)
+                .expect("a bad thinking value must not fail the request");
+            assert!(parsed.thinking.is_none());
+        }
+    }
+
+    /// The fallback must not swallow values that are actually valid.
+    #[test]
+    fn a_valid_thinking_value_is_preserved() {
+        let body = json!({
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "model": "claude-sonnet-4-20250514",
+            "thinking": { "type": "enabled", "budget_tokens": 2048 },
+        });
+
+        let parsed: CreateMessageParams = serde_json::from_value(body).unwrap();
+
+        assert!(matches!(
+            parsed.thinking,
+            Some(Thinking::Enabled {
+                budget_tokens: 2048
+            })
+        ));
+    }
+
+    /// An explicit null and an absent field both mean "no preference".
+    #[test]
+    fn an_absent_or_null_thinking_value_is_none() {
+        for body in [
+            json!({
+                "max_tokens": 1024,
+                "messages": [{ "role": "user", "content": "hi" }],
+                "model": "claude-sonnet-4-20250514",
+            }),
+            json!({
+                "max_tokens": 1024,
+                "messages": [{ "role": "user", "content": "hi" }],
+                "model": "claude-sonnet-4-20250514",
+                "thinking": null,
+            }),
+        ] {
+            let parsed: CreateMessageParams = serde_json::from_value(body).unwrap();
+            assert!(parsed.thinking.is_none());
+        }
+    }
+
+    /// A delta type this crate does not model must not kill the stream. The
+    /// enum is internally tagged, so before `Unknown` existed an unrecognised
+    /// `type` was a hard deserialize error -- fatal mid-response, where there
+    /// is no way to report it and nothing already sent can be taken back.
+    #[test]
+    fn an_unmodelled_content_block_delta_survives() {
+        let raw = json!({ "type": "delta_from_next_year", "whatever": [1, 2] });
+
+        let delta: ContentBlockDelta =
+            serde_json::from_value(raw.clone()).expect("an unknown delta must not fail the stream");
+
+        assert!(matches!(delta, ContentBlockDelta::Unknown(_)));
+        assert_eq!(
+            serde_json::to_value(&delta).unwrap(),
+            raw,
+            "an unknown delta must forward byte-for-byte"
+        );
+    }
+
+    /// Citations and compaction deltas are real events on the current API.
+    /// They were missing, which meant enabling citations turned every
+    /// streamed response into a parse failure.
+    #[test]
+    fn citation_and_compaction_deltas_are_modelled() {
+        let citations = json!({
+            "type": "citations_delta",
+            "citation": {
+                "type": "char_location",
+                "cited_text": "hi",
+                "document_index": 0,
+                "document_title": null,
+                "start_char_index": 0,
+                "end_char_index": 2
+            }
+        });
+        let delta: ContentBlockDelta = serde_json::from_value(citations.clone()).unwrap();
+        assert!(matches!(delta, ContentBlockDelta::CitationsDelta { .. }));
+        assert_eq!(serde_json::to_value(&delta).unwrap(), citations);
+
+        let compaction = json!({
+            "type": "compaction_delta",
+            "content": "summary",
+            "encrypted_content": null
+        });
+        let delta: ContentBlockDelta = serde_json::from_value(compaction).unwrap();
+        assert!(matches!(delta, ContentBlockDelta::CompactionDelta { .. }));
+    }
+
+    /// Forwarding is the whole job, so a request carrying the newer fields has
+    /// to come out the other side unchanged. Before these were modelled they
+    /// landed in no field at all and were dropped silently, which is worse
+    /// than failing: the upstream just quietly ignored what the caller asked
+    /// for.
+    #[test]
+    fn the_newer_request_fields_round_trip() {
+        let body = json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            "inference_geo": "us",
+            "speed": "fast",
+            "diagnostics": { "previous_message_id": null },
+            "fallbacks": [
+                { "model": "claude-haiku-4-5", "speed": "standard" }
+            ],
+            "fallback_credit_token": { "token": "tok_1", "mode": "best_effort" }
+        });
+
+        let params: CreateMessageParams = serde_json::from_value(body.clone()).unwrap();
+
+        assert!(matches!(params.speed, Some(Speed::Fast)));
+        assert_eq!(params.inference_geo.as_deref(), Some("us"));
+        // Present-but-null is the documented way to opt in on a first turn,
+        // and has to stay distinguishable from an absent field.
+        assert!(matches!(
+            params.diagnostics.as_ref().map(|d| &d.previous_message_id),
+            Some(Some(None))
+        ));
+        assert!(matches!(params.fallbacks, Some(FallbacksParam::Models(_))));
+
+        assert_eq!(serde_json::to_value(&params).unwrap(), body);
+    }
+
+    /// `"default"` and an explicit chain share one field, so the untagged enum
+    /// has to tell them apart in both directions.
+    #[test]
+    fn the_default_fallback_selection_round_trips() {
+        let body = json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "fallbacks": "default",
+            "fallback_credit_token": "tok_bare"
+        });
+
+        let params: CreateMessageParams = serde_json::from_value(body.clone()).unwrap();
+
+        assert!(matches!(
+            params.fallbacks,
+            Some(FallbacksParam::Default(FallbacksDefault::Default))
+        ));
+        assert!(matches!(
+            params.fallback_credit_token,
+            Some(FallbackCreditToken::Token(_))
+        ));
+        assert_eq!(serde_json::to_value(&params).unwrap(), body);
+    }
 
     #[test]
     fn deserializes_claude_code_builtin_tools_without_input_schema() {

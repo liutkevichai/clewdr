@@ -35,14 +35,15 @@ impl Hash for UselessCookie {
 }
 
 impl UselessCookie {
-    /// Creates a new UselessCookie instance
+    /// Creates a new `UselessCookie` instance
     ///
     /// # Arguments
     /// * `cookie` - The cookie that is unusable
     /// * `reason` - The reason why the cookie is unusable
     ///
     /// # Returns
-    /// A new UselessCookie instance
+    /// A new `UselessCookie` instance
+    #[must_use]
     pub fn new(cookie: ClewdrCookie, reason: Reason) -> Self {
         Self { cookie, reason }
     }

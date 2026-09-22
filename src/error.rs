@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use anthropic_wire::{ContentBlock, Message, Role};
 use axum::{
     Json,
     extract::rejection::{JsonRejection, PathRejection, QueryRejection},
@@ -7,7 +8,6 @@ use axum::{
 };
 use chrono::Utc;
 use colored::Colorize;
-use oauth2::{RequestTokenError, StandardErrorResponse, basic::BasicErrorResponseType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::Location;
@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error};
 use wreq::{Response, StatusCode, header::InvalidHeaderValue};
 
-use crate::{config::Reason, types::claude::Message};
+use crate::config::Reason;
 
 #[derive(Debug, IntoStaticStr, snafu::Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -29,21 +29,11 @@ pub enum ClewdrError {
         loc: Location,
         source: http::Error,
     },
-    #[snafu(display("Ractor error: {}", msg))]
-    RactorError {
-        #[snafu(implicit)]
-        loc: Location,
-        msg: String,
-    },
-    #[snafu(display("Error requesting token: {}", source))]
-    #[snafu(context(false))]
+    #[snafu(display("Error requesting token: {}, at: {}", msg, loc))]
     RequestTokenError {
         #[snafu(implicit)]
         loc: Location,
-        source: RequestTokenError<
-            oauth2::HttpClientError<wreq::Error>,
-            StandardErrorResponse<BasicErrorResponseType>,
-        >,
+        msg: String,
     },
     #[snafu(display("URL parse error: {}, at: {}", source, loc))]
     UrlError {
@@ -158,7 +148,7 @@ pub enum ClewdrError {
     TimestampError { timestamp: i64 },
     #[snafu(display("Key/Password Invalid"))]
     InvalidAuth,
-    #[snafu(whatever, display("{}: {}", message, source.as_ref().map_or_else(|| "Unknown error".into(), |e| e.to_string())))]
+    #[snafu(whatever, display("{}: {}", message, source.as_ref().map_or_else(|| "Unknown error".into(), std::string::ToString::to_string)))]
     Whatever {
         message: String,
         #[snafu(source(from(Box<dyn std::error::Error + Send>, Some)))]
@@ -177,10 +167,6 @@ impl IntoResponse for ClewdrError {
                 StatusCode::BAD_REQUEST,
                 json!(format!("{}: {} (URL: {})", loc, source, url)),
             ),
-            ClewdrError::ParseCookieError { .. } => {
-                (StatusCode::BAD_REQUEST, json!(self.to_string()))
-            }
-            ClewdrError::InvalidUri { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathRejection { ref source } => {
                 (source.status(), json!(source.body_text()))
             }
@@ -193,8 +179,11 @@ impl IntoResponse for ClewdrError {
             ClewdrError::TestMessage => {
                 return (
                     StatusCode::OK,
-                    Json(Message::from(
-                        "Claude Reverse Proxy is working, please send a real message.",
+                    Json(Message::new_blocks(
+                        Role::Assistant,
+                        vec![ContentBlock::text(
+                            "Claude Reverse Proxy is working, please send a real message.",
+                        )],
                     )),
                 )
                     .into_response();
@@ -203,11 +192,13 @@ impl IntoResponse for ClewdrError {
                 (source.status(), json!(source.body_text()))
             }
             ClewdrError::TooManyRetries => (StatusCode::GATEWAY_TIMEOUT, json!(self.to_string())),
-            ClewdrError::InvalidCookie { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
-            ClewdrError::BadRequest { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
-            ClewdrError::InvalidHeaderValue { .. } => {
+            ClewdrError::ParseCookieError { .. }
+            | ClewdrError::InvalidUri { .. }
+            | ClewdrError::InvalidCookie { .. }
+            | ClewdrError::BadRequest { .. }
+            | ClewdrError::InvalidHeaderValue { .. } => {
                 (StatusCode::BAD_REQUEST, json!(self.to_string()))
             }
             ClewdrError::EmptyChoices => (StatusCode::NO_CONTENT, json!(self.to_string())),
@@ -294,6 +285,9 @@ impl CheckClaudeErr for Response {
     /// * `Ok(Response)` if the request was successful
     /// * `Err(ClewdrError)` if the request failed, with details about the failure
     async fn check_claude(self) -> Result<Self, ClewdrError> {
+        const OAUTH_403_PHRASE: &str =
+            "oauth authentication is currently not allowed for this organization";
+
         let status = self.status();
         if status.is_success() {
             return Ok(self);
@@ -347,8 +341,6 @@ impl CheckClaudeErr for Response {
         if status == 401 {
             return Err(Reason::Null.into());
         }
-        const OAUTH_403_PHRASE: &str =
-            "oauth authentication is currently not allowed for this organization";
         if status == 403
             && err
                 .error
@@ -362,20 +354,6 @@ impl CheckClaudeErr for Response {
         let inner_error = err.error;
         // check if the error is a rate limit error
         if status == 429 {
-            // Long-context 1M gating also uses 429; keep it as HTTP error so upper
-            // retry logic can downgrade to non-1M without cooling down the cookie.
-            let msg_lower = inner_error
-                .message
-                .as_str()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_else(|| inner_error.message.to_string().to_ascii_lowercase());
-            if msg_lower.contains("extra usage is required for long context requests") {
-                return Err(ClewdrError::ClaudeHttpError {
-                    code: status,
-                    inner: inner_error,
-                });
-            }
-
             // get the reset time from the error message
             let ts = inner_error.message["resetsAt"]
                 .as_i64()
@@ -386,20 +364,16 @@ impl CheckClaudeErr for Response {
                     .to_utc();
                 let now = chrono::Utc::now();
                 let diff = reset_time - now;
-                let mins = diff.num_minutes();
-                error!(
-                    "Rate limit exceeded, expires in {} hours",
-                    mins as f64 / 60.0
-                );
+                let hours = diff.as_seconds_f64() / 3600.0;
+                error!("Rate limit exceeded, expires in {hours} hours");
                 return Err(ClewdrError::InvalidCookie {
                     reason: Reason::TooManyRequest(ts),
                 });
-            } else {
-                error!("Rate limit exceeded, but no reset time provided");
-                return Err(ClewdrError::InvalidCookie {
-                    reason: Reason::TooManyRequest(Utc::now().timestamp() + 3600),
-                });
             }
+            error!("Rate limit exceeded, but no reset time provided");
+            return Err(ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(Utc::now().timestamp() + 3600),
+            });
         }
         Err(ClewdrError::ClaudeHttpError {
             code: status,

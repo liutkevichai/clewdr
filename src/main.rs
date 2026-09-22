@@ -47,16 +47,6 @@ where
 /// Result indicating success or failure of the application execution
 #[tokio::main]
 async fn main() -> Result<(), ClewdrError> {
-    // Ensure a crypto provider is installed before rustls usage (yup-oauth2 / hyper-rustls).
-    #[cfg(target_os = "android")]
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install ring crypto provider");
-    #[cfg(not(target_os = "android"))]
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("failed to install aws-lc crypto provider");
-
     #[cfg(windows)]
     {
         _ = enable_ansi_support::enable_ansi_support();
@@ -80,7 +70,7 @@ async fn main() -> Result<(), ClewdrError> {
     let subscriber = Registry::default().with(
         fmt::Layer::default()
             .with_writer(std::io::stdout)
-            .with_timer(timer.to_owned())
+            .with_timer(timer.clone())
             .with_ansi(stdout_is_tty)
             .with_ansi_sanitization(false)
             .with_filter(env_filter),
@@ -126,7 +116,6 @@ async fn main() -> Result<(), ClewdrError> {
     let addr = CLEWDR_CONFIG.load().address();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let router = clewdr::router::RouterBuilder::new()
-        .await
         .with_default_setup()
         .build();
     // serve the application

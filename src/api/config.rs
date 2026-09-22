@@ -1,11 +1,21 @@
-use axum::Json;
+use std::sync::Arc;
+
+use axum::{Json, extract::State};
 use axum_auth::AuthBearer;
 use clewdr_types::ConfigApi;
 use serde_json::json;
 
 use super::error::ApiError;
-use crate::config::{CLEWDR_CONFIG, ClewdrConfig};
+use crate::{
+    config::{CLEWDR_CONFIG, ClewdrConfig},
+    services::cookie_pool::CookiePool,
+};
 
+/// Return the current configuration, with secrets already elided by the
+/// [`ConfigApi`] conversion.
+///
+/// # Errors
+/// [`ApiError::unauthorized`] if the bearer token is not the admin password.
 pub async fn api_get_config(AuthBearer(t): AuthBearer) -> Result<Json<ConfigApi>, ApiError> {
     if !CLEWDR_CONFIG.load().admin_auth(&t) {
         return Err(ApiError::unauthorized());
@@ -15,7 +25,16 @@ pub async fn api_get_config(AuthBearer(t): AuthBearer) -> Result<Json<ConfigApi>
     Ok(Json(api))
 }
 
+/// Replace the configuration and persist it.
+///
+/// Cookies are unaffected: they belong to the pool, and are only recombined
+/// with the settings when the file is written.
+///
+/// # Errors
+/// [`ApiError::unauthorized`] if the bearer token is not the admin password,
+/// or [`ApiError::internal`] if the new config cannot be written to disk.
 pub async fn api_post_config(
+    State(pool): State<CookiePool>,
     AuthBearer(t): AuthBearer,
     Json(c): Json<ConfigApi>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -23,14 +42,9 @@ pub async fn api_post_config(
         return Err(ApiError::unauthorized());
     }
     let c: ClewdrConfig = ClewdrConfig::from(c).validate();
-    CLEWDR_CONFIG.rcu(|old_c| {
-        let mut new_c = ClewdrConfig::clone(&c);
-        new_c.cookie_array = old_c.cookie_array.to_owned();
-        new_c.wasted_cookie = old_c.wasted_cookie.to_owned();
-        new_c
-    });
-    if let Err(e) = CLEWDR_CONFIG.load().save().await {
-        return Err(ApiError::internal(format!("Failed to save config: {}", e)));
+    CLEWDR_CONFIG.store(Arc::new(c.clone()));
+    if let Err(e) = CLEWDR_CONFIG.load().save(&pool.snapshot()).await {
+        return Err(ApiError::internal(format!("Failed to save config: {e}")));
     }
 
     Ok(Json(json!({

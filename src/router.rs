@@ -9,42 +9,50 @@ use tower::ServiceBuilder;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
-    api::*,
+    api::{
+        api_auth, api_claude_code, api_claude_code_count_tokens, api_claude_web, api_delete_cookie,
+        api_get_config, api_get_cookies, api_get_models, api_post_config, api_post_cookie,
+        api_version,
+    },
     middleware::{
         RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
     },
     providers::claude::ClaudeProviders,
-    services::cookie_actor::CookieActorHandle,
+    services::cookie_pool::CookiePool,
 };
 
-/// RouterBuilder for the application
+/// `RouterBuilder` for the application
 pub struct RouterBuilder {
     claude_providers: ClaudeProviders,
-    cookie_actor_handle: CookieActorHandle,
+    cookie_pool: CookiePool,
     inner: Router,
 }
 
 impl RouterBuilder {
-    /// Creates a blank RouterBuilder instance
-    /// Initializes the router with the provided application state
+    /// Creates a blank `RouterBuilder`, loading the cookie pool from the
+    /// configuration and starting its background reset ticker.
     ///
-    /// # Arguments
-    /// * `state` - The application state containing client information
-    pub async fn new() -> Self {
-        let cookie_handle = CookieActorHandle::start()
-            .await
-            .expect("Failed to start CookieActor");
-        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone());
+    /// Must be called from within a Tokio runtime.
+    #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "starts a background task and needs a Tokio runtime, so it is \
+                  not a cheap `Default`"
+    )]
+    pub fn new() -> Self {
+        let cookie_pool = CookiePool::start();
+        let claude_providers = crate::providers::claude::build_providers(cookie_pool.clone());
         RouterBuilder {
             claude_providers,
-            cookie_actor_handle: cookie_handle,
+            cookie_pool,
             inner: Router::new(),
         }
     }
 
-    /// Creates a new RouterBuilder instance
+    /// Creates a new `RouterBuilder` instance
     /// Sets up routes for API endpoints and static file serving
+    #[must_use]
     pub fn with_default_setup(self) -> Self {
         self.route_claude_code_endpoints()
             .route_claude_web_endpoints()
@@ -96,10 +104,11 @@ impl RouterBuilder {
         let cookie_router = Router::new()
             .route("/cookies", get(api_get_cookies))
             .route("/cookie", delete(api_delete_cookie).post(api_post_cookie))
-            .with_state(self.cookie_actor_handle.to_owned());
+            .with_state(self.cookie_pool.clone());
         let admin_router = Router::new()
             .route("/auth", get(api_auth))
-            .route("/config", get(api_get_config).post(api_post_config));
+            .route("/config", get(api_get_config).post(api_post_config))
+            .with_state(self.cookie_pool.clone());
         let router = Router::new()
             .nest(
                 "/api",
@@ -158,11 +167,10 @@ impl RouterBuilder {
         }
         #[cfg(feature = "external-resource")]
         {
-            use const_format::formatc;
             use tower_http::services::ServeDir;
-            self.inner = self.inner.fallback_service(ServeDir::new(formatc!(
-                "{}/static",
-                env!("CARGO_MANIFEST_DIR")
+            self.inner = self.inner.fallback_service(ServeDir::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/static"
             )));
         }
         self
