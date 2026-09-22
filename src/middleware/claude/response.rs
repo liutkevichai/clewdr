@@ -1,3 +1,4 @@
+use anthropic_wire::{CreateMessageResponse, StreamEvent};
 use axum::{
     Json,
     body::{self, Body},
@@ -9,12 +10,9 @@ use http::header::CONTENT_TYPE;
 use tracing::warn;
 
 use super::{ClaudeApiFormat, transform_stream};
-use crate::{
-    middleware::claude::{ClaudeContext, transforms_json},
-    types::claude::{CreateMessageResponse, StreamEvent},
-};
+use crate::middleware::claude::{ClaudeContext, transforms_json};
 
-async fn parse_response<T>(resp: Response) -> Result<T, Response>
+async fn parse_response<T>(resp: Response) -> Result<T, Box<Response>>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -28,7 +26,8 @@ where
         return Err(Response::builder()
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body))
-            .unwrap());
+            .unwrap()
+            .into());
     };
     Ok(parsed)
 }
@@ -60,17 +59,25 @@ pub async fn to_oai(resp: Response) -> impl IntoResponse {
     }
     if !cx.is_stream() {
         match parse_response::<CreateMessageResponse>(resp).await {
-            Ok(response) => return Json(transforms_json(response)).into_response(),
-            Err(resp) => return resp,
+            Ok(response) => return Json(transforms_json(&response)).into_response(),
+            Err(resp) => return *resp,
         }
     }
     let stream = resp.into_body().into_data_stream().eventsource();
     let stream = transform_stream(stream);
     Sse::new(stream)
-        .keep_alive(Default::default())
+        .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
 }
 
+/// Attach the recorded token usage to an outgoing response.
+///
+/// Responses carrying no [`ClaudeContext`] are passed through untouched.
+///
+/// # Panics
+/// If a rewritten stream event fails to serialize back to JSON. The events
+/// were just deserialized from the same shape, so this cannot happen in
+/// practice.
 pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
     let Some(cx) = resp.extensions().get::<ClaudeContext>() else {
         return resp;
@@ -79,7 +86,7 @@ pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
     if !stream {
         let mut response = match parse_response::<CreateMessageResponse>(resp).await {
             Ok(response) => response,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
         let output_tokens = response.count_tokens();
         usage.output_tokens = output_tokens;
@@ -104,7 +111,7 @@ pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
             };
             match parsed {
                 StreamEvent::MessageStart { mut message } => {
-                    message.usage.get_or_insert(usage.to_owned());
+                    message.usage.get_or_insert(usage.clone());
                     new_event
                         .json_data(StreamEvent::MessageStart { message })
                         .unwrap()
@@ -123,7 +130,7 @@ pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
         });
 
     Sse::new(stream)
-        .keep_alive(Default::default())
+        .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
 }
 

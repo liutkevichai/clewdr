@@ -1,6 +1,6 @@
-//! Tests for OAI ImageUrl to Claude Image format conversion
+//! Tests for OAI `ImageUrl` to Claude Image format conversion
 //!
-//! This test suite validates that OpenAI format image_url blocks are correctly
+//! This test suite validates that OpenAI format `image_url` blocks are correctly
 //! converted to Claude's image format with proper source structure.
 //!
 //! ## Background
@@ -8,17 +8,15 @@
 //! Claude uses `image: { source: { type: "base64", media_type: "image/png", data: "..." } }`
 //!
 //! ## Fixed Issues
-//! - CC proxy was passing ImageUrl directly to Claude API, causing 400/422 errors
+//! - CC proxy was passing `ImageUrl` directly to Claude API, causing 400/422 errors
 
 #[cfg(test)]
 mod tests {
-    use clewdr::types::{
-        claude::{
-            ContentBlock, CreateMessageParams as ClaudeCreateMessageParams, ImageSource, ImageUrl,
-            Message, MessageContent, Role,
-        },
-        oai::CreateMessageParams as OaiCreateMessageParams,
+    use anthropic_wire::{
+        ContentBlock, CreateMessageParams as ClaudeCreateMessageParams, ImageSource, ImageUrl,
+        Message, MessageContent, Role,
     };
+    use clewdr::types::oai::CreateMessageParams as OaiCreateMessageParams;
 
     #[test]
     fn test_image_source_from_data_url_png() {
@@ -35,7 +33,7 @@ mod tests {
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
                 );
             }
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -51,7 +49,7 @@ mod tests {
                 assert_eq!(media_type, "image/jpeg");
                 assert_eq!(data, "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBg==");
             }
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -64,7 +62,7 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/webp"),
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -110,7 +108,7 @@ mod tests {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, "iVBORw0KGgo=");
             }
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -122,7 +120,7 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/jpeg"),
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -143,7 +141,7 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/png"),
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
 
         // mixed case Base64
@@ -199,9 +197,9 @@ mod tests {
                         assert_eq!(media_type, "image/png");
                         assert_eq!(data, "iVBORw0KGgo=");
                     }
-                    other => panic!("Expected Base64 image source, got {:?}", other),
+                    other => panic!("Expected Base64 image source, got {other:?}"),
                 },
-                other => panic!("Expected Image block, got {:?}", other),
+                other => panic!("Expected Image block, got {other:?}"),
             }
         } else {
             panic!("Expected Blocks content");
@@ -304,7 +302,7 @@ mod tests {
                         matches!(source, ImageSource::Base64 { data, .. } if data == "existing_data")
                     );
                 }
-                other => panic!("Expected Image block, got {:?}", other),
+                other => panic!("Expected Image block, got {other:?}"),
             }
         }
     }

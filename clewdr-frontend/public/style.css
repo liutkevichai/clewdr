@@ -75,9 +75,6 @@
 [data-theme="light"] .section-title-exhausted { color: #b45309; }
 [data-theme="light"] .section-title-invalid   { color: #dc2626; }
 
-[data-theme="light"] .badge-on  { color: #16a34a; background: rgba(22,163,74,0.1);  border-color: rgba(22,163,74,0.3); }
-[data-theme="light"] .badge-off { color: #58667a; background: rgba(100,116,139,0.08); border-color: rgba(100,116,139,0.25); }
-
 [data-theme="light"] .cookie-section-valid    { background: rgba(22,163,74,0.02); border-color: rgba(22,163,74,0.18); }
 [data-theme="light"] .cookie-section-exhausted { background: rgba(180,83,9,0.02); border-color: rgba(180,83,9,0.18); }
 [data-theme="light"] .cookie-section-invalid   { background: rgba(220,38,38,0.02); border-color: rgba(220,38,38,0.18); }
@@ -88,7 +85,10 @@
 /* ── Reset & Base ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-html { font-size: 15px; }
+/* Follow the browser's own font size instead of pinning a px value, so the UI
+   honours the reader's preference. The rem scale below is built on the 16px
+   default and never drops below 0.75rem (12px). */
+html { font-size: 100%; }
 body {
     font-family: var(--font);
     background: var(--bg);
@@ -111,11 +111,13 @@ body {
 
 /* ── Typography ────────────────────────────────────────────────── */
 h1,.h1 { font-size: 1.25rem; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }
-h2,.h2 { font-size: 1.15rem; font-weight: 600; color: var(--text); }
-h3,.h3 { font-size: 1.05rem; font-weight: 600; color: var(--text); }
+h2,.h2 { font-size: 1.125rem; font-weight: 600; color: var(--text); }
+h3,.h3 { font-size: 1.0625rem; font-weight: 600; color: var(--text); }
 h4,.h4 { font-size: 0.875rem; font-weight: 600; color: var(--text-dim); }
 
-.text-xs   { font-size: 0.75rem; }
+/* 0.8125rem (13px) is the smallest body-copy step; 0.75rem (12px) is the floor
+   for incidental labels. Nothing should go below it. */
+.text-xs   { font-size: 0.8125rem; }
 .text-sm   { font-size: 0.875rem; }
 .text-base { font-size: 1rem; }
 .text-dim  { color: var(--text-dim); }
@@ -202,12 +204,12 @@ a:hover, .link:hover { color: var(--accent-hi); }
     border-color: var(--border-hi);
 }
 
-.btn-sm { padding: 0.375rem 0.75rem; font-size: 0.75rem; }
-.btn-xs { padding: 0.25rem 0.5rem; font-size: 0.7rem; border-radius: var(--radius-sm); }
+.btn-sm { padding: 0.375rem 0.75rem; font-size: 0.8125rem; }
+.btn-xs { padding: 0.25rem 0.5rem; font-size: 0.75rem; border-radius: var(--radius-sm); }
 
 /* ── Inputs ────────────────────────────────────────────────────── */
 .label { display: block; font-size: 0.875rem; color: var(--text-dim); margin-bottom: 0.25rem; }
-.label-sm { font-size: 0.75rem; color: var(--text-mute); }
+.label-sm { font-size: 0.8125rem; color: var(--text-mute); }
 
 .input, .textarea {
     width: 100%; padding: 0.6rem 0.85rem;
@@ -234,6 +236,10 @@ a:hover, .link:hover { color: var(--accent-hi); }
     resize: vertical; min-height: 100px; line-height: 1.6;
     font-family: var(--mono); font-size: 0.8125rem;
 }
+
+/* The monospace face runs visibly smaller than the UI face at the same size,
+   so give it a step back when it sits inline with regular text. */
+.text-mono.text-xs { font-size: 0.875rem; }
 
 input[type="checkbox"] {
     appearance: none; -webkit-appearance: none;
@@ -302,7 +308,7 @@ input[type="checkbox"]:checked::after {
 
 .sub-tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
 .sub-tab {
-    padding: 0.375rem 0.75rem; font-size: 0.8125rem;
+    padding: 0.375rem 0.75rem; font-size: 0.875rem;
     border-radius: var(--radius);
     background: var(--surface); color: var(--text-dim);
     border: 1px solid var(--border); cursor: pointer;
@@ -346,7 +352,7 @@ input[type="checkbox"]:checked::after {
 .section-title-exhausted  { color: #facc15; }
 .section-title-invalid    { color: #f87171; }
 
-.section-empty { font-size: 0.75rem; color: var(--text-mute); }
+.section-empty { font-size: 0.8125rem; color: var(--text-mute); }
 
 .cookie-row {
     display: flex; align-items: flex-start; gap: 0.5rem;
@@ -354,22 +360,9 @@ input[type="checkbox"]:checked::after {
 }
 .cookie-row + .cookie-row { border-top: 1px solid var(--divider); }
 
-/* ── Badges (1M toggles) ───────────────────────────────────────── */
-.badge {
-    padding: 0.25rem 0.5rem; font-size: 0.7rem;
-    border-radius: var(--radius-sm); border: 1px solid;
-    cursor: pointer; font-family: var(--font);
-    transition: all 150ms ease;
-}
-.badge:disabled { opacity: 0.5; cursor: not-allowed; }
-.badge-on  { background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.4); color: #4ade80; }
-.badge-off { background: rgba(100,116,139,0.1); border-color: rgba(100,116,139,0.3); color: #94a3b8; }
-.badge-on:hover:not(:disabled)  { background: rgba(34,197,94,0.2); }
-.badge-off:hover:not(:disabled) { background: rgba(100,116,139,0.2); }
-
 /* ── Lang selector ─────────────────────────────────────────────── */
 .lang-btn {
-    padding: 0.25rem 0.5rem; font-size: 0.7rem; border-radius: var(--radius-sm);
+    padding: 0.25rem 0.5rem; font-size: 0.75rem; border-radius: var(--radius-sm);
     border: none; cursor: pointer; font-family: var(--font); font-weight: 500;
     transition: all 150ms ease;
 }
@@ -386,7 +379,7 @@ input[type="checkbox"]:checked::after {
 
 /* ── Delete icon ───────────────────────────────────────────────── */
 .icon-del {
-    color: #f87171; font-size: 0.75rem; cursor: pointer;
+    color: #f87171; font-size: 0.8125rem; cursor: pointer;
     background: none; border: none;
     transition: color 150ms ease;
 }
@@ -394,7 +387,7 @@ input[type="checkbox"]:checked::after {
 .icon-del:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .icon-copy {
-    color: var(--text-mute); font-size: 0.7rem; cursor: pointer;
+    color: var(--text-mute); font-size: 0.75rem; cursor: pointer;
     background: none; border: none;
     transition: color 150ms ease;
 }
@@ -402,7 +395,7 @@ input[type="checkbox"]:checked::after {
 
 /* ── Usage details ─────────────────────────────────────────────── */
 details summary {
-    cursor: pointer; font-size: 0.75rem; color: var(--text-mute);
+    cursor: pointer; font-size: 0.8125rem; color: var(--text-mute);
     transition: color 150ms ease; padding: 0.125rem 0;
 }
 details summary:hover { color: var(--text-dim); }
@@ -420,7 +413,7 @@ details summary:hover { color: var(--text-dim); }
     margin-bottom: 0.25rem;
 }
 .config-section-desc {
-    font-size: 0.75rem; color: var(--text-mute);
+    font-size: 0.8125rem; color: var(--text-mute);
     margin-bottom: 0.75rem;
 }
 
@@ -444,10 +437,10 @@ details summary:hover { color: var(--text-dim); }
 
 .progress-label {
     display: flex; justify-content: space-between; align-items: baseline;
-    font-size: 0.75rem;
+    font-size: 0.8125rem;
 }
 .progress-label span:first-child { color: var(--text-dim); }
-.progress-label span:last-child { color: var(--text-mute); font-size: 0.6875rem; }
+.progress-label span:last-child { color: var(--text-mute); font-size: 0.75rem; }
 
 /* ── Divider ───────────────────────────────────────────────────── */
 .divider {
@@ -472,7 +465,8 @@ details summary:hover { color: var(--text-dim); }
 
 /* ── Responsive ────────────────────────────────────────────────── */
 @media (max-width: 640px) {
-    html { font-size: 14px; }
+    /* Reclaim width by tightening padding, not by shrinking text: small screens
+       are where legibility matters most. */
     .container { padding: 0 0.75rem; }
 }
 

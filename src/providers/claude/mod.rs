@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
+use anthropic_wire::CreateMessageParams;
 use axum::response::Response;
 use colored::Colorize;
 use tracing::info;
@@ -10,8 +11,7 @@ use crate::{
     claude_web_state::ClaudeWebState,
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
-    services::cookie_actor::CookieActorHandle,
-    types::claude::CreateMessageParams,
+    services::cookie_pool::CookiePool,
     utils::{enabled, print_out_json},
 };
 
@@ -29,6 +29,7 @@ pub struct ClaudeInvocation {
 }
 
 impl ClaudeInvocation {
+    #[must_use]
     pub fn messages(params: CreateMessageParams, context: ClaudeContext) -> Self {
         Self {
             params,
@@ -37,6 +38,7 @@ impl ClaudeInvocation {
         }
     }
 
+    #[must_use]
     pub fn count_tokens(params: CreateMessageParams, context: ClaudeContext) -> Self {
         Self {
             params,
@@ -52,14 +54,12 @@ pub struct ClaudeProviderResponse {
 }
 
 struct ClaudeSharedState {
-    cookie_actor_handle: CookieActorHandle,
+    cookie_pool: CookiePool,
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle) -> Self {
-        Self {
-            cookie_actor_handle,
-        }
+    fn new(cookie_pool: CookiePool) -> Self {
+        Self { cookie_pool }
     }
 }
 
@@ -70,17 +70,20 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle));
+    #[must_use]
+    pub fn new(cookie_pool: CookiePool) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(cookie_pool));
         let web = Arc::new(ClaudeWebProvider::new(shared.clone()));
         let code = Arc::new(ClaudeCodeProvider::new(shared.clone()));
         Self { web, code }
     }
 
+    #[must_use]
     pub fn web(&self) -> Arc<ClaudeWebProvider> {
         self.web.clone()
     }
 
+    #[must_use]
     pub fn code(&self) -> Arc<ClaudeCodeProvider> {
         self.code.clone()
     }
@@ -103,7 +106,7 @@ impl LLMProvider for ClaudeWebProvider {
     type Output = ClaudeProviderResponse;
 
     async fn invoke(&self, request: Self::Request) -> Result<Self::Output, ClewdrError> {
-        let mut state = ClaudeWebState::new(self.shared.cookie_actor_handle.clone());
+        let mut state = ClaudeWebState::new(self.shared.cookie_pool.clone());
         let stream = request.context.is_stream();
         state.api_format = request.context.api_format();
         state.stream = stream;
@@ -159,11 +162,11 @@ impl LLMProvider for ClaudeCodeProvider {
     type Output = ClaudeProviderResponse;
 
     async fn invoke(&self, request: Self::Request) -> Result<Self::Output, ClewdrError> {
-        let mut state = ClaudeCodeState::new(self.shared.cookie_actor_handle.clone());
+        let mut state = ClaudeCodeState::new(self.shared.cookie_pool.clone());
         state.api_format = request.context.api_format();
         state.stream = request.context.is_stream();
         state.system_prompt_hash = request.context.system_prompt_hash();
-        state.anthropic_beta_header = request.context.anthropic_beta().map(str::to_string);
+        state.anthropic_beta = request.context.anthropic_beta().map(str::to_owned);
         state.usage = request.context.usage().to_owned();
         let ClaudeInvocation {
             params,
@@ -212,6 +215,7 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle)
+#[must_use]
+pub fn build_providers(cookie_pool: CookiePool) -> ClaudeProviders {
+    ClaudeProviders::new(cookie_pool)
 }

@@ -1,16 +1,15 @@
 use std::{
     env,
     hash::{DefaultHasher, Hash, Hasher},
-    mem,
     sync::LazyLock,
     vec,
 };
 
+use anthropic_wire::{ContentBlock, CreateMessageParams, Message, MessageContent, Role, Usage};
 use axum::{
     Json,
     extract::{FromRequest, Request},
 };
-use http::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -19,9 +18,7 @@ use crate::{
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     types::{
-        claude::{
-            ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
-        },
+        model::{ModelTraits, split_thinking_suffix},
         oai::CreateMessageParams as OaiCreateMessageParams,
     },
 };
@@ -39,7 +36,7 @@ use crate::{
 /// - Detects and processes "thinking mode" requests by modifying model names
 /// - Identifies test messages and handles them appropriately
 /// - Attempts to retrieve responses from cache before processing requests
-/// - Provides format information via the FormatInfo extension
+/// - Provides format information via the `FormatInfo` extension
 pub struct ClaudeWebPreprocess(pub CreateMessageParams, pub ClaudeContext);
 
 /// Contains information about the API format and streaming status
@@ -110,18 +107,17 @@ fn first_user_message_text(messages: &[Message]) -> &str {
         .unwrap_or_default()
 }
 
-fn sample_js_code_unit(text: &str, idx: usize) -> String {
-    text.encode_utf16()
-        .nth(idx)
-        .map(|unit| String::from_utf16_lossy(&[unit]))
-        .unwrap_or_else(|| "0".to_string())
+fn sample_js_code_unit(text: &str, idx: usize) -> u16 {
+    text.encode_utf16().nth(idx).unwrap_or(u16::from(b'0'))
 }
 
 fn claude_code_billing_header(messages: &[Message]) -> String {
+    let text = first_user_message_text(messages);
     let sampled = [4, 7, 20]
         .into_iter()
-        .map(|idx| sample_js_code_unit(first_user_message_text(messages), idx))
-        .collect::<String>();
+        .map(|idx| sample_js_code_unit(text, idx))
+        .collect::<Vec<_>>();
+    let sampled = String::from_utf16_lossy(&sampled);
     let version_hash = hex::encode(Sha256::digest(format!(
         "{CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}"
     )));
@@ -189,26 +185,6 @@ fn strip_ephemeral_scope_from_system(system: &mut Value) {
     }
 }
 
-fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
-    let mut parts = Vec::new();
-    for value in headers.get_all("anthropic-beta") {
-        if let Ok(raw) = value.to_str() {
-            for token in raw.split(',') {
-                let token = token.trim();
-                if !token.is_empty() {
-                    parts.push(token.to_string());
-                }
-            }
-        }
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(","))
-    }
-}
-
 fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
     msgs.into_iter()
         .filter_map(|m| {
@@ -273,9 +249,18 @@ where
             // Trim whitespace and drop empty assistant turns when enabled.
             body.messages = sanitize_messages(body.messages);
         }
-        if body.model.ends_with("-thinking") {
-            body.model = body.model.trim_end_matches("-thinking").to_string();
-            body.thinking.get_or_insert(Thinking::new(4096));
+        let (base_model, wants_thinking) = split_thinking_suffix(&body.model);
+        let traits = ModelTraits::of(base_model);
+        if wants_thinking {
+            body.model = base_model.to_string();
+            if let Some(traits) = traits {
+                body.thinking
+                    .get_or_insert_with(|| traits.thinking_for_suffix());
+            }
+        }
+        // Rewrite parameters the target model would reject outright.
+        if let Some(traits) = traits {
+            traits.sanitize(&mut body);
         }
         drop_empty_system(&mut body);
         Ok(Self(body, format))
@@ -307,7 +292,7 @@ where
         let info = ClaudeWebContext {
             stream,
             api_format: format,
-            stop_sequences: body.stop_sequences.to_owned().unwrap_or_default(),
+            stop_sequences: body.stop_sequences.clone().unwrap_or_default(),
             usage: Usage {
                 input_tokens,
                 output_tokens: 0, // Placeholder for output token count
@@ -326,7 +311,7 @@ pub struct ClaudeCodeContext {
     pub(super) api_format: ClaudeApiFormat,
     /// The hash of the system messages for caching purposes
     pub(super) system_prompt_hash: Option<u64>,
-    /// Optional anthropic-beta header forwarded from client request
+    /// Client-supplied Anthropic beta tokens to forward upstream
     pub(super) anthropic_beta: Option<String>,
     // Usage information for the request
     pub(super) usage: Usage,
@@ -341,12 +326,12 @@ where
     type Rejection = ClewdrError;
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let anthropic_beta = extract_anthropic_beta_header(req.headers());
+        let anthropic_beta = req
+            .headers()
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let NormalizeRequest(mut body, format) = NormalizeRequest::from_request(req, &()).await?;
-        // Handle thinking mode by modifying the model name
-        if body.temperature.is_some() {
-            body.top_p = None; // temperature and top_p cannot be used together in Opus-4.x
-        }
 
         // Check for test messages and respond appropriately
         if !body.stream.unwrap_or_default()
@@ -416,12 +401,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_code_billing_header_matches_2176_rule() {
+    fn claude_code_billing_header_matches_21258_rule() {
         let messages = vec![Message::new_text(Role::User, "hey")];
 
         assert_eq!(
             claude_code_billing_header(&messages),
-            "x-anthropic-billing-header: cc_version=2.1.76.4dc; cc_entrypoint=cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli; cch=00000;"
+        );
+    }
+
+    #[test]
+    fn claude_code_billing_header_joins_sampled_utf16_units_before_encoding() {
+        let messages = vec![Message::new_text(Role::User, "aaaa😀😀abcdefghijklmnop")];
+
+        assert_eq!(
+            claude_code_billing_header(&messages),
+            "x-anthropic-billing-header: cc_version=2.1.258.fde; cc_entrypoint=cli; cch=00000;"
         );
     }
 
@@ -432,7 +427,7 @@ mod tests {
                 Role::User,
                 vec![
                     ContentBlock::Image {
-                        source: crate::types::claude::ImageSource::Url {
+                        source: anthropic_wire::ImageSource::Url {
                             url: "https://example.com/a.png".to_string(),
                         },
                         cache_control: None,
@@ -446,7 +441,7 @@ mod tests {
 
         assert_eq!(
             claude_code_billing_header(&messages),
-            "x-anthropic-billing-header: cc_version=2.1.76.540; cc_entrypoint=cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.258.de6; cc_entrypoint=cli; cch=00000;"
         );
     }
 

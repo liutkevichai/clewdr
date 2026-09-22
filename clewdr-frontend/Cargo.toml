@@ -2,13 +2,16 @@
 name = "clewdr-frontend"
 version = "0.1.0"
 edition = "2024"
+# Internal to clewdr: shared with the frontend over a path dependency, with no
+# meaning outside this workspace.
+publish = false
 
 [dependencies]
 clewdr-types = { path = "../clewdr-types" }
 console_error_panic_hook = "0.1"
 console_log = "1"
-gloo-net = { version = "0.6", features = ["http"] }
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-net = { version = "0.7", features = ["http"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 js-sys = "0.3"
 leptos = { version = "0.8", features = ["csr"] }
 leptos_meta = "0.8"
@@ -31,3 +34,6 @@ web-sys = { version = "0.3", features = [
   "UrlSearchParams",
   "Window",
 ] }
+
+[lints]
+workspace = true

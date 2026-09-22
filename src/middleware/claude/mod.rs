@@ -3,13 +3,12 @@ mod request;
 mod response;
 mod stop_sequences;
 
+use anthropic_wire::Usage;
 pub(crate) use claude2oai::*;
 pub use request::*;
 pub use response::*;
 pub use stop_sequences::*;
 use strum::Display;
-
-use crate::types::claude::Usage;
 
 /// Represents the format of the API response
 ///
@@ -31,6 +30,7 @@ pub enum ClaudeContext {
 }
 
 impl ClaudeContext {
+    #[must_use]
     pub fn is_stream(&self) -> bool {
         match self {
             ClaudeContext::Web(ctx) => ctx.stream,
@@ -38,6 +38,7 @@ impl ClaudeContext {
         }
     }
 
+    #[must_use]
     pub fn api_format(&self) -> ClaudeApiFormat {
         match self {
             ClaudeContext::Web(ctx) => ctx.api_format,
@@ -45,14 +46,17 @@ impl ClaudeContext {
         }
     }
 
+    #[must_use]
     pub fn is_web(&self) -> bool {
         matches!(self, ClaudeContext::Web(_))
     }
 
+    #[must_use]
     pub fn is_code(&self) -> bool {
         matches!(self, ClaudeContext::Code(_))
     }
 
+    #[must_use]
     pub fn stop_sequences(&self) -> &[String] {
         match self {
             ClaudeContext::Web(ctx) => &ctx.stop_sequences,
@@ -60,6 +64,7 @@ impl ClaudeContext {
         }
     }
 
+    #[must_use]
     pub fn system_prompt_hash(&self) -> Option<u64> {
         match self {
             ClaudeContext::Web(_) => None,
@@ -67,17 +72,19 @@ impl ClaudeContext {
         }
     }
 
-    pub fn usage(&self) -> &Usage {
-        match self {
-            ClaudeContext::Web(ctx) => &ctx.usage,
-            ClaudeContext::Code(ctx) => &ctx.usage,
-        }
-    }
-
+    #[must_use]
     pub fn anthropic_beta(&self) -> Option<&str> {
         match self {
             ClaudeContext::Web(_) => None,
             ClaudeContext::Code(ctx) => ctx.anthropic_beta.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn usage(&self) -> &Usage {
+        match self {
+            ClaudeContext::Web(ctx) => &ctx.usage,
+            ClaudeContext::Code(ctx) => &ctx.usage,
         }
     }
 }

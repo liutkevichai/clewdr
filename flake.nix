@@ -1,0 +1,498 @@
+{
+  description = "clewdr builds: linux binaries (gnu/musl × x86_64/aarch64), distroless OCI images, checks, dev shell";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, crane, rust-overlay }:
+    let
+      localSystem = "x86_64-linux";
+      pkgsNative = import nixpkgs {
+        system = localSystem;
+        overlays = [ (import rust-overlay) ];
+        # The android NDK (Google-licensed) for the aarch64-android target.
+        config.allowUnfree = true;
+      };
+      nativeLib = crane.mkLib pkgsNative;
+      # The default cleanCargoSource keeps only cargo-relevant files; the
+      # frontend also ships html/css/ico assets that trunk needs, so the
+      # source is filtered with crane's common cargo sources plus web assets
+      # (the same set as crane's own trunk example).
+      cargoAndAssets = pkgsNative.lib.fileset.unions [
+        (nativeLib.fileset.commonCargoSources ./.)
+        (pkgsNative.lib.fileset.fileFilter (
+          file:
+          pkgsNative.lib.any file.hasExt [
+            "html"
+            "css"
+            "js"
+            "ico"
+            "png"
+            "svg"
+            "json"
+          ]
+        ) ./.)
+      ];
+      src = pkgsNative.lib.fileset.toSource {
+        root = ./.;
+        fileset = cargoAndAssets;
+      };
+      # The checks lint the workflows too, so they need to be in *their*
+      # source. The build derivations' source deliberately leaves them out, or
+      # editing a workflow would rebuild five targets.
+      srcWithWorkflows = pkgsNative.lib.fileset.toSource {
+        root = ./.;
+        fileset = pkgsNative.lib.fileset.unions [
+          cargoAndAssets
+          (pkgsNative.lib.fileset.fileFilter (
+            file: pkgsNative.lib.any file.hasExt [ "yml" "yaml" ]
+          ) ./.github)
+        ];
+      };
+
+      # --- toolchains ----------------------------------------------------
+      # 1.98.0 is the rustc floor: wreq 0.16 needs it. Pinned exactly, with
+      # wasm32 (frontend + its lint) and clippy (xtask lint).
+      # `minimal` plus what we actually use, not `default`: the default profile
+      # drags in rust-docs, which is 1.45 GB of nar across the two toolchains
+      # and which every job would download and unpack to never open.
+      stableToolchain = p:
+        p.rust-bin.stable."1.98.0".minimal.override {
+          targets = [ "wasm32-unknown-unknown" ];
+          extensions = [ "clippy" ];
+        };
+      # Pinned nightly for rustfmt: .rustfmt.toml uses nightly-only options.
+      # Dates are not interchangeable - rustfmt is missing from some nightly
+      # manifests - so check before moving this. 2026-08-21 formats this
+      # workspace identically to the 2026-03-15 it replaced, verified with
+      # `cargo fmt --all --check`.
+      nightlyNative = pkgsNative.rust-bin.nightly."2026-08-21".minimal.override {
+        extensions = [ "rustfmt" ];
+      };
+
+      nativeCrane = nativeLib.overrideToolchain stableToolchain;
+
+      # --- wasm-bindgen-cli --------------------------------------------------
+      # The frontend's Cargo.lock pins wasm-bindgen 0.2.127 and trunk refuses
+      # a mismatch; nixpkgs tops out at 0.2.126. Use the official prebuilt
+      # (static musl) release, pinned by hash.
+      wasmBindgenCli = pkgsNative.runCommand "wasm-bindgen-cli-0.2.127" { } ''
+        mkdir -p $out/bin
+        tar -xzf ${pkgsNative.fetchurl {
+          url = "https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz";
+          hash = "sha256-YdSn3IWs+g0jVMzAuDYZKMflKnRtF/KOuqeV7T3BYUo=";
+        }}
+        mv wasm-bindgen-0.2.127-x86_64-unknown-linux-musl/wasm-bindgen $out/bin/
+      '';
+
+      # --- frontend --------------------------------------------------------
+      # Trunk writes to ../static (Trunk.toml), so buildTrunkPackage's default
+      # install step is replaced: the output of this derivation *is* the
+      # static/ directory contents.
+      wasmArgs = {
+        inherit src;
+        pname = "clewdr-frontend";
+        strictDeps = true;
+        cargoExtraArgs = "--locked --package=clewdr-frontend";
+        CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+      };
+      static = nativeCrane.buildTrunkPackage (wasmArgs // {
+        wasm-bindgen-cli = wasmBindgenCli;
+        preBuild = "cd clewdr-frontend";
+        postBuild = "cd ..";
+        installPhaseCommand = "cp -r ./static $out";
+        # Built explicitly: buildTrunkPackage's auto-generated deps build
+        # would inherit this installPhaseCommand and fail (a deps-only build
+        # has no static/ to install). cargoCheckCommand for the same reason as
+        # the cross targets: trunk runs `cargo build`, so the metadata-only
+        # pass over ~350 wasm dependencies has no consumer.
+        cargoArtifacts = nativeCrane.buildDepsOnly (wasmArgs // {
+          installPhaseCommand = "mkdir -p $out";
+          cargoCheckCommand = ":";
+        });
+      });
+
+      # The version comes from the manifest so it cannot drift from the crate
+      # (which is also why Cargo.toml has to stay parseable by fromTOML).
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+
+      # The C toolchain btls-sys' vendored BoringSSL needs, in every place it
+      # is needed: the cross builds, the checks derivation and the dev shell.
+      # git is not optional - btls-sys initialises its BoringSSL submodule.
+      buildToolNames = [ "cmake" "perl" "gnumake" "ninja" "git" ];
+      buildToolsFrom = p: (map (n: p.${n}) buildToolNames) ++ [ p.llvmPackages.libclang.lib ];
+
+      # --- cross builds -----------------------------------------------------
+      mkPkgs = crossSystem:
+        import nixpkgs ({
+          inherit localSystem;
+          overlays = [ (import rust-overlay) ];
+          # The android NDK (Google-licensed) is needed for the
+          # aarch64-android target; harmless for the others.
+          config.allowUnfree = true;
+        } // (if crossSystem == null then { } else { inherit crossSystem; }));
+
+      # The raw NDK tree (btls-sys wants ANDROID_NDK_HOME with
+      # build/cmake/android.toolchain.cmake); same version androidndkPkgs_27
+      # builds its toolchain from. Accessed through androidndkPkgs rather than
+      # androidenv.composeAndroidPackages directly: the direct call fails to
+      # evaluate inside this flake ("attribute 'ndk-bundle' missing" from
+      # within the derivation, even though the same drv evaluates fine via
+      # this route — some attrset self-reference quirk in androidenv).
+      androidNdk = pkgsNative.lib.head
+        pkgsNative.androidndkPkgs_27.binaries.propagatedBuildInputs;
+      # Where the NDK keeps the arm64 bionic libs, incl. libc++_shared.so.
+      androidSysrootLibs = "${androidNdk}/libexec/android-sdk/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android";
+
+      # nixpkgs' cc-wrapper appends `-frandom-seed=<derivation output hash>` to
+      # its cflags, and the bindgen hook copies those into
+      # BINDGEN_EXTRA_CLANG_ARGS. bindgen's build script declares
+      # rerun-if-env-changed for that variable, so its value differing between
+      # the deps derivation and the one that inherits them made bindgen dirty,
+      # and with it btls-sys (BoringSSL's bindings) and everything above it:
+      # btls, tokio-btls, wreq, wreq-util recompiled in every final build.
+      # bindgen only parses headers, so a codegen seed means nothing to it.
+      stripRandomSeed = ''
+        export BINDGEN_EXTRA_CLANG_ARGS="$(
+          printf '%s' "$BINDGEN_EXTRA_CLANG_ARGS" | sed -E 's/ ?-frandom-seed=[^ ]*//g'
+        )"
+      '';
+
+      # Builds the server for one target with one feature set. The C++ deps
+      # (btls-sys vendored BoringSSL) need git (submodule init), libclang
+      # (bindgen) and cmake/perl/ninja; bindgenHook feeds the cross clang's
+      # libc cflags into BINDGEN_EXTRA_CLANG_ARGS.
+      #
+      # `static` (the frontend output) is injected at build time via preBuild
+      # rather than wrapped into the source: wrapping the source in a
+      # derivation would force its realisation at *evaluation* time, because
+      # crane's dependency vendoring reads the source directory.
+      mk = crossSystem: features: staticDir:
+        let
+          pkgs = mkPkgs crossSystem;
+          isAndroid = pkgs.stdenv.hostPlatform.isAndroid;
+          # The gnu targets link dynamically, and nix bakes the *store* loader
+          # path into them, which exists on no machine but a nix one. The
+          # release zips have to run on any distro, so the loader is pointed
+          # back at the standard path after install. Nothing else stands in
+          # the way: RUNPATH comes out empty, and the symbol floors are
+          # glibc 2.38 and GLIBCXX 3.4.20 (measured), i.e. no tighter than the
+          # ubuntu-built binaries these replace.
+          standardInterpreter =
+            if pkgs.stdenv.hostPlatform.isAarch64 then
+              "/lib/ld-linux-aarch64.so.1"
+            else
+              "/lib64/ld-linux-x86-64.so.2";
+          # The android cross set needs a different toolchain story: rust-overlay
+          # cannot evaluate its toolchains inside it (the target-side splice is
+          # empty, and gccForLibs pulls a from-source android gcc that fails on
+          # missing bionic headers). Instead, use the native-set toolchain with
+          # the android std added — rustc runs on x86_64 either way, and the
+          # linker is the NDK clang from the cross stdenv's CC env.
+          craneLib = if isAndroid then
+            (crane.mkLib pkgs).overrideToolchain
+              (pkgsNative.rust-bin.stable."1.98.0".minimal.override {
+                targets = [ "aarch64-linux-android" ];
+              })
+          else
+            # A function, so crane splices the toolchain for the cross set.
+            # `or null` because a cross set without rust-overlay's attrs is a
+            # real case (see the android branch above, which sidesteps it).
+            # One toolchain from the *native* package set for every target,
+            # rather than `p: p.rust-bin...` per cross set. rustc runs on the
+            # build platform regardless, and it only needs the target's std,
+            # which `targets` provides. Asking each cross instantiation for its
+            # own toolchain produced five byte-identical copies of
+            # rust-minimal-1.98.0 under five different store paths, 170 MB
+            # each. The android branch above already had to do it this way.
+            (crane.mkLib pkgs).overrideToolchain (
+              pkgsNative.rust-bin.stable."1.98.0".minimal.override {
+                targets = [ pkgs.stdenv.hostPlatform.rust.cargoShortTarget ];
+              });
+          buildArgs = {
+            pname = "clewdr";
+            inherit version;
+            inherit src;
+            cargoLock = ./Cargo.lock;
+            cargoExtraArgs = "--no-default-features --features ${features} -p clewdr";
+            doCheck = false;
+            strictDeps = true;
+            nativeBuildInputs = buildToolsFrom pkgs.pkgsBuildHost
+              ++ (if isAndroid then [ ] else [ pkgs.rustPlatform.bindgenHook ]);
+            LIBCLANG_PATH = "${pkgs.pkgsBuildHost.llvmPackages.libclang.lib}/lib";
+            preBuild = stripRandomSeed;
+          } // pkgs.lib.optionalAttrs isAndroid {
+            # nixpkgs' cross stdenv exports SYSROOT (the NDK bionic sysroot),
+            # and cargo's target-info probe reads it as the rustc --sysroot,
+            # where rustlib does not exist — the probe then fails. Unset it in
+            # preBuild; the NDK clang wrapper carries the sysroot in its own
+            # cc-cflags, so the C++ builds keep it.
+            preBuild = stripRandomSeed + "\nunset SYSROOT";
+            # rustc 1.98 dropped the long-name alias for the android target:
+            # `--target aarch64-unknown-linux-android` fails with "could not
+            # find specification". The builtin (and cargo-ndk's) name is
+            # `aarch64-linux-android`; nixpkgs derives the long form, so pin
+            # the short one here. The std dir is shared (rustlib/<target>),
+            # and the repo's .cargo/config.toml already keys its android
+            # rustflags on the short name.
+            CARGO_BUILD_TARGET = "aarch64-linux-android";
+            # rustc's default linker for android targets is `cc`; point it at
+            # the NDK clang wrapper the cross stdenv already provides.
+            CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER =
+              "${pkgs.stdenv.cc}/bin/aarch64-unknown-linux-android-cc";
+            # btls-sys's cmake cross path requires the NDK root (its
+            # android.toolchain.cmake drives the BoringSSL build). The
+            # deployAndroidPackage output nests the NDK under
+            # libexec/android-sdk/ndk-bundle.
+            ANDROID_NDK_HOME = "${androidNdk}/libexec/android-sdk/ndk-bundle";
+            # clewdr's own build.rs android path is written for cargo-ndk: it
+            # reads these to copy libc++_shared.so next to the binary (the
+            # .cargo/config.toml rpath is $ORIGIN). postInstall puts the
+            # library beside the installed binary, matching the release zip.
+            CARGO_NDK_SYSROOT_LIBS_PATH = androidSysrootLibs;
+            # Replicates nixpkgs' bindgenHook, which cannot be used here: it
+            # references the cross set's clang, and for android that is a
+            # from-source clang (compiler-rt) rather than the NDK toolchain.
+            # The NDK cc-wrapper ships the same nix-support cflags files the
+            # hook reads. ($NIX_CFLAGS_COMPILE is dropped: it is runtime env
+            # and cannot be baked into an env var at eval time.)
+            BINDGEN_EXTRA_CLANG_ARGS = pkgs.lib.concatStringsSep " " (
+              pkgs.lib.optional
+                (pkgs.lib.pathExists "${pkgs.stdenv.cc}/nix-support/cc-cflags")
+                (builtins.readFile "${pkgs.stdenv.cc}/nix-support/cc-cflags")
+              ++ pkgs.lib.optional
+                (pkgs.lib.pathExists "${pkgs.stdenv.cc}/nix-support/libc-cflags")
+                (builtins.readFile "${pkgs.stdenv.cc}/nix-support/libc-cflags")
+              ++ pkgs.lib.optional
+                (pkgs.lib.pathExists "${pkgs.stdenv.cc}/nix-support/libcxx-cxxflags")
+                (builtins.readFile "${pkgs.stdenv.cc}/nix-support/libcxx-cxxflags")
+            );
+          };
+          depsExpression = { }: craneLib.buildDepsOnly (buildArgs // {
+            # The same features as the final build, deliberately. A feature
+            # *union* was tried first, so one dependency build could serve
+            # both the portable release artifact and the xdg image; measured on
+            # a real CI run, it made every final build recompile nine crates
+            # (wreq, btls, tokio-btls, tower-http, flate2, miniz_oxide,
+            # simd-adler32, bitflags, wreq-util), because cargo fingerprints
+            # features and the union resolves them differently. The sharing it
+            # bought was worth nothing: no single job builds both feature sets
+            # - the release zips and the images are built in different jobs,
+            # which do not share a store.
+            #
+            # buildDepsOnly runs `cargo check` *and* `cargo build` in its build
+            # phase, so one dependency build can serve both check-style
+            # consumers (clippy) and build-style ones (buildPackage). Note
+            # `doCheck = false` does not turn the check off: it only drops the
+            # `cargo test --no-run` pass and `--all-targets`.
+            #
+            # These cross artifacts have exactly one consumer, buildPackage
+            # below, so the metadata-only pass is dead weight. checks.ci is a
+            # separate native derivation and never inherits these.
+            cargoCheckCommand = ":";
+          });
+          crateExpression = { }: craneLib.buildPackage (buildArgs // {
+            cargoArtifacts = pkgs.callPackage depsExpression { };
+            # Not in buildArgs: a deps-only build has no $out/bin to put it
+            # next to.
+            postInstall = pkgs.lib.optionalString isAndroid ''
+              cp ${androidSysrootLibs}/libc++_shared.so $out/bin/
+            '';
+            # After nix's own fixupPhase, which is what shrinks RUNPATH.
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isGnu ''
+              patchelf --set-interpreter ${standardInterpreter} $out/bin/clewdr
+            '';
+            # Not in buildArgs: the deps-only build must not depend on the
+            # frontend output, or every frontend change would invalidate the
+            # dependency cache. (buildArgs.preBuild, if any, runs first.)
+            preBuild = (buildArgs.preBuild or "") + "\n" + ''
+              mkdir -p static
+              cp -r ${staticDir}/* static/
+            '';
+          });
+        in
+        pkgs.callPackage crateExpression { };
+
+      # --- distroless image assembly ----------------------------------------
+      # The runtime base stays gcr.io/distroless/static-debian13 (pinned by
+      # digest via pullImage; bump the digests + sha256s together to update
+      # the base). The nix-built static binary is layered on top, upx'd like
+      # the current Dockerfile does.
+      # Digest and its nix hash belong together: both have to be bumped in
+      # the same edit, so they live in the same attrset.
+      distroless = {
+        amd64 = {
+          digest = "sha256:0985f124d25d79a432b79e806764a9deb759e5c664be7c0633b9f13c3e12cbc0";
+          hash = "sha256-VH/TrMOuSPGO/2KYYOXidKw47dfnT1jQrKkBl0zoOLo=";
+        };
+        arm64 = {
+          digest = "sha256:15a69c654ed239b3faf5bc3725ff1dd580462eb882c7d5b9c02cdf37756657c2";
+          hash = "sha256-ER1dxk1umx3Va8plikllvWo/lTlvz5RlOfnB6sSYHso=";
+        };
+      };
+
+      imageFor = arch: base': binary:
+        let
+          base = pkgsNative.dockerTools.pullImage {
+            imageName = "gcr.io/distroless/static-debian13";
+            imageDigest = base'.digest;
+            sha256 = base'.hash;
+            arch = arch;
+            os = "linux";
+            finalImageName = "clewdr";
+            finalImageTag = "nix-${arch}";
+          };
+          compressed = pkgsNative.runCommand "clewdr-upx-${arch}" { nativeBuildInputs = [ pkgsNative.upx ]; } ''
+            mkdir -p $out/usr/local/bin
+            upx --best --lzma ${binary}/bin/clewdr -o $out/usr/local/bin/clewdr
+          '';
+          etc = pkgsNative.runCommand "clewdr-etc" { } ''
+            mkdir -p $out/etc/clewdr/log
+            touch $out/etc/clewdr/clewdr.toml
+          '';
+        in
+        pkgsNative.dockerTools.buildLayeredImage {
+          name = "clewdr";
+          tag = "nix-${arch}";
+          # Uncompressed: go-containerregistry's `crane push` reads docker
+          # tarballs only, and fails on a gzipped one with "invalid tar
+          # header". The registry compresses layers on the wire anyway.
+          compressor = "none";
+          # streamLayeredImage defaults to the host platform; the base's
+          # architecture is not inherited from fromImage.
+          architecture = arch;
+          fromImage = base;
+          contents = [ compressed etc ];
+          config = {
+            Env = [
+              "CLEWDR_IP=0.0.0.0"
+              "CLEWDR_PORT=8484"
+              "CLEWDR_CHECK_UPDATE=FALSE"
+              "CLEWDR_AUTO_UPDATE=FALSE"
+            ];
+            ExposedPorts = { "8484/tcp" = { }; };
+            Volumes = { "/etc/clewdr" = { }; };
+            Cmd = [
+              "/usr/local/bin/clewdr"
+              "--config"
+              "/etc/clewdr/clewdr.toml"
+              "--log-dir"
+              "/etc/clewdr/log"
+            ];
+          };
+        };
+
+      mkImage = arch: mkMusl:
+        imageFor arch distroless.${arch}
+          (mkMusl "embed-resource,xdg" static);
+
+      # --- checks -----------------------------------------------------------
+      # Shared by the check derivation and its dependency build.
+      checksArgs = {
+        inherit version;
+        src = srcWithWorkflows;
+        cargoLock = ./Cargo.lock;
+        strictDeps = true;
+        # Mirrors xtask's ensure_static_dir: the embed-resource combinations
+        # only need the directory to exist.
+        preBuild = stripRandomSeed + ''
+          mkdir -p static
+          echo '<!doctype html><title>ClewdR</title>' > static/index.html
+        '';
+        # actionlint is part of the lint step, so the checks derivation is
+        # where the workflows actually get linted; without it xtask skips them.
+        nativeBuildInputs = buildToolsFrom pkgsNative ++ [
+          pkgsNative.rustPlatform.bindgenHook
+          pkgsNative.actionlint
+        ];
+        LIBCLANG_PATH = "${pkgsNative.llvmPackages.libclang.lib}/lib";
+      };
+
+      # The dependency build the checks inherit. This is the consumer crane's
+      # default check+build+test passes exist for: xtask runs clippy (wants
+      # metadata) and `cargo test` (wants linkable artifacts) over the same
+      # dependency graph.
+      #
+      # Two things have to match xtask exactly or nothing is reused:
+      #   - the dev profile, because xtask's clippy and test runs pass no
+      #     --release (crane would otherwise cache release artifacts);
+      #   - the feature set. This is the union of xtask's four combinations
+      #     (FEATURE_COMBINATIONS in xtask/src/main.rs), which the two
+      #     external-resource passes reuse as-is; the two embed-resource
+      #     passes still recompile tower-http, which loses its fs feature
+      #     there, and whatever depends on it.
+      checksDeps = nativeCrane.buildDepsOnly (checksArgs // {
+        pname = "clewdr-checks-deps";
+        CARGO_PROFILE = "dev";
+        cargoExtraArgs =
+          "--locked --workspace --no-default-features"
+          + " --features external-resource,embed-resource,portable,xdg";
+        # clippy --all-targets and `cargo test` both need the dev-dependencies
+        # built, which is what --all-targets pulls in here.
+        cargoCheckExtraArgs = "--all-targets";
+      });
+    in
+    {
+      packages.${localSystem} = {
+        inherit static;
+        clewdr-gnu-x86_64 = mk null "embed-resource,portable" static;
+        clewdr-musl-x86_64 = mk "x86_64-unknown-linux-musl" "embed-resource,portable" static;
+        clewdr-gnu-aarch64 = mk "aarch64-unknown-linux-gnu" "embed-resource,portable" static;
+        clewdr-musl-aarch64 = mk "aarch64-unknown-linux-musl" "embed-resource,portable" static;
+        # The bare target string does not set useAndroidPrebuilt, and the
+        # example ships with it false, which makes nixpkgs attempt to build
+        # the whole android toolchain (compiler-rt, bionic) from source — it
+        # gets stuck on missing pthread.h. With the flag on, nixpkgs uses the
+        # prebuilt NDK (allowUnfree) instead.
+        clewdr-android-aarch64 = mk
+          (pkgsNative.lib.systems.examples.aarch64-android // { useAndroidPrebuilt = true; })
+          "embed-resource,portable" static;
+        image-amd64 = mkImage "amd64" (mk "x86_64-unknown-linux-musl");
+        image-arm64 = mkImage "arm64" (mk "aarch64-unknown-linux-musl");
+        # CI helper: go-containerregistry crane (image push), pinned to the
+        # flake's nixpkgs.
+        crane = pkgsNative.crane;
+      };
+
+      checks.${localSystem} = {
+        # The single gate, `cargo xtask ci` (fmt --check, lint, test), run as
+        # one cached derivation. Same entry point as developers and CI.
+        ci = nativeCrane.buildPackage (checksArgs // {
+          pname = "clewdr-checks";
+          cargoArtifacts = checksDeps;
+          buildPhaseCargoCommand = "cargo xtask ci";
+          doCheck = false;
+          doInstallCargoArtifacts = false;
+          doNotPostBuildInstallCargoBinaries = true;
+          installPhaseCommand = "touch $out";
+          CLEWDR_NIGHTLY_CARGO = "${nightlyNative}/bin/cargo";
+          # Runs fully sandboxed: the workspace test suite is hermetic (unit
+          # tests only, no network).
+        });
+        # Stands in for the release build on PRs: embed-resource,portable,
+        # release profile, links and runs.
+        smoke = self.packages.${localSystem}.clewdr-gnu-x86_64;
+      };
+
+      devShells.${localSystem}.default = nativeCrane.devShell {
+        packages = [
+          pkgsNative.trunk
+          pkgsNative.binaryen
+          pkgsNative.dart-sass
+          wasmBindgenCli
+          pkgsNative.actionlint
+          # For `cargo xtask verify-push`, which runs the docker job's publish
+          # script against a local registry.
+          pkgsNative.crane
+        ] ++ buildToolsFrom pkgsNative;
+        env = {
+          LIBCLANG_PATH = "${pkgsNative.llvmPackages.libclang.lib}/lib";
+          CLEWDR_NIGHTLY_CARGO = "${nightlyNative}/bin/cargo";
+        };
+      };
+    };
+}

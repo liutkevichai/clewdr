@@ -2,24 +2,73 @@ use std::{
     collections::HashSet,
     fmt::{Debug, Display},
     net::{IpAddr, SocketAddr},
+    path::Path,
+    sync::LazyLock,
 };
 
 use axum::http::{Uri, uri::Scheme};
 use clap::Parser;
 use colored::Colorize;
-use figment::{
-    Figment,
-    providers::{Env, Format, Toml},
-};
 use http::uri::Authority;
-use passwords::PasswordGenerator;
 use serde::{Deserialize, Serialize};
-use tokio::spawn;
-use tracing::error;
+use tokio::{io::AsyncWriteExt, spawn};
+use tracing::{error, warn};
 use url::Url;
 use wreq::Proxy;
 
-use super::{CONFIG_PATH, ENDPOINT_URL};
+use super::{
+    CLEWDR_CONFIG, CONFIG_PATH, CookieSnapshot, ENDPOINT_URL,
+    loader::{merge_sources, parse_each},
+};
+
+/// Moves the cookies out of the global config and returns them.
+///
+/// Call once, from the cookie pool's constructor: afterwards the pool is their
+/// sole owner and [`CLEWDR_CONFIG`] carries empty cookie sets. Calling it twice
+/// would hand the second caller nothing.
+pub fn take_global_cookies() -> CookieSnapshot {
+    let mut taken = CookieSnapshot::default();
+    CLEWDR_CONFIG.rcu(|config| {
+        let mut config = ClewdrConfig::clone(config);
+        // May run more than once under contention, but each attempt re-reads
+        // the live config, which still holds the cookies until a swap lands.
+        taken = config.take_cookies();
+        config
+    });
+    taken
+}
+
+/// Serializes writers to [`CONFIG_PATH`]. Held across the whole
+/// write-flush-rename sequence, so two concurrent savers cannot interleave and
+/// the file always reflects one of them in full.
+static SAVE_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Writes `data` to `tmp`, flushes it to disk, then renames it over `dst`.
+///
+/// The flush has to happen before the rename: without it a crash can leave the
+/// rename durable but the contents not, which is exactly the truncated-config
+/// case the temp file is meant to prevent.
+async fn write_then_rename(tmp: &Path, dst: &Path, data: &[u8]) -> Result<(), ClewdrError> {
+    let mut file = create_private(tmp).await?;
+    file.write_all(data).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(tmp, dst).await?;
+    Ok(())
+}
+
+/// Creates `path` truncated and owner-only where the platform supports it.
+///
+/// The mode is set at creation rather than chmod-ed afterwards so the config,
+/// which holds the admin password and cookies, is never briefly world-readable.
+/// The mode carries through the rename onto the real config file.
+async fn create_private(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path).await
+}
 use crate::{
     Args,
     config::{
@@ -30,35 +79,87 @@ use crate::{
     utils::enabled,
 };
 
+/// The alphabet a generated password draws from.
+///
+/// Alphanumerics minus the glyphs that are easy to confuse when a password is
+/// read off one screen and typed into another: `0`/`O`, `1`/`l`/`I`.
+const PASSWORD_ALPHABET: &[u8] = b"23456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ";
+
+/// Length of a generated password, in characters
+const PASSWORD_LENGTH: usize = 64;
+
+/// The largest multiple of the alphabet size that fits in a byte.
+///
+/// Bytes at or above it are discarded rather than folded back into the
+/// alphabet: `byte % 56` alone would map five distinct byte values onto the
+/// alphabet's first 32 characters and only four onto the rest, making those
+/// characters likelier and costing the password some of its entropy.
+/// Computed in `usize` because 256, the number of byte values, is one past
+/// what a `u8` holds.
+const PASSWORD_SAMPLE_CUTOFF: usize = 256 - (256 % PASSWORD_ALPHABET.len());
+
+/// Maps uniformly random bytes onto [`PASSWORD_ALPHABET`], discarding those
+/// that would bias the result, until `length` characters have been produced.
+///
+/// Split from [`generate_password`] so the sampling can be checked against a
+/// known byte sequence instead of inferred from the output's statistics.
+fn password_from_bytes(bytes: impl Iterator<Item = u8>, length: usize) -> String {
+    bytes
+        .filter(|&b| usize::from(b) < PASSWORD_SAMPLE_CUTOFF)
+        .map(|b| PASSWORD_ALPHABET[usize::from(b) % PASSWORD_ALPHABET.len()] as char)
+        .take(length)
+        .collect()
+}
+
 /// Generates a random password for authentication
 /// Creates a secure 64-character password with mixed character types
 ///
 /// # Returns
 /// A random password string
+///
+/// # Panics
+/// If the OS refuses to supply randomness. Continuing past that would mean
+/// inventing a predictable admin password, so failing loudly is the only
+/// correct response.
 fn generate_password() -> String {
-    let pg = PasswordGenerator {
-        length: 64,
-        numbers: true,
-        lowercase_letters: true,
-        uppercase_letters: true,
-        symbols: false,
-        spaces: false,
-        exclude_similar_characters: true,
-        strict: true,
-    };
-
     println!("{}", "Generating random password......".green());
-    pg.generate_one().unwrap()
+
+    // Drawn a buffer at a time: rejection means the number of bytes needed is
+    // not known up front, but one syscall almost always covers it.
+    let mut buf = [0u8; PASSWORD_LENGTH];
+    let mut next = buf.len();
+    let random_bytes = std::iter::from_fn(|| {
+        if next == buf.len() {
+            getrandom::fill(&mut buf)
+                .expect("the OS must provide randomness for the admin password");
+            next = 0;
+        }
+        let byte = buf[next];
+        next += 1;
+        Some(byte)
+    });
+
+    password_from_bytes(random_bytes, PASSWORD_LENGTH)
 }
 
 /// A struct representing the configuration of the application
+// The bool fields are flat keys in the user's TOML. Grouping them into
+// sub-structs, as the lint suggests, would break every existing config file.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the on-disk config format"
+)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClewdrConfig {
-    // key configurations
+    // Cookies are owned by the cookie pool at runtime; these fields only carry
+    // them between deserialization and `take_cookies`, and are re-filled from a
+    // `CookieSnapshot` when writing the file. Outside that window they are
+    // empty, which is why they are private -- reading them would silently
+    // yield nothing.
     #[serde(default)]
-    pub cookie_array: HashSet<CookieStatus>,
+    cookie_array: HashSet<CookieStatus>,
     #[serde(default)]
-    pub wasted_cookie: HashSet<UselessCookie>,
+    wasted_cookie: HashSet<UselessCookie>,
 
     // Server settings, cannot hot reload
     #[serde(default = "default_ip")]
@@ -177,14 +278,18 @@ impl Display for ClewdrConfig {
         let authority: Authority = authority.to_string().parse().map_err(|_| std::fmt::Error)?;
         let api_url = Uri::builder()
             .scheme(Scheme::HTTP)
-            .authority(authority.to_owned())
+            .authority(authority.clone())
             .path_and_query("/v1")
             .build()
             .map_err(|_| std::fmt::Error)?;
         let web_url = Uri::builder()
             .scheme(Scheme::HTTP)
             .authority(authority.to_string())
-            .path_and_query("")
+            // Must be "/", not "": http rejects an empty path-and-query with
+            // InvalidUri(Empty), which surfaces as a panic in the `println!`
+            // that prints this config at startup. Both render as a trailing
+            // slash, so the output is unchanged.
+            .path_and_query("/")
             .build()
             .map_err(|_| std::fmt::Error)?;
         write!(
@@ -201,7 +306,7 @@ impl Display for ClewdrConfig {
             self.admin_password.yellow(),
         )?;
         if let Some(ref proxy) = self.proxy {
-            writeln!(f, "Proxy: {}", proxy.to_string().blue())?;
+            writeln!(f, "Proxy: {}", proxy.clone().blue())?;
         }
         if let Some(ref rproxy) = self.rproxy {
             writeln!(f, "Reverse Proxy: {}", rproxy.to_string().blue())?;
@@ -239,7 +344,7 @@ impl From<&ClewdrConfig> for clewdr_types::ConfigApi {
             password: c.password.clone(),
             admin_password: c.admin_password.clone(),
             proxy: c.proxy.clone(),
-            rproxy: c.rproxy.as_ref().map(|u| u.to_string()),
+            rproxy: c.rproxy.as_ref().map(std::string::ToString::to_string),
             max_retries: c.max_retries,
             preserve_chats: c.preserve_chats,
             web_search: c.web_search,
@@ -310,22 +415,56 @@ impl ClewdrConfig {
             .to_string()
     }
 
-    /// Loads configuration from files and environment variables
-    /// Combines settings from config.toml, clewdr.toml, and environment variables
-    /// Also loads cookies from a file if specified
+    /// Builds a config from the text of the config file and the environment.
+    ///
+    /// Split out from [`Self::new`] so the merge can be exercised without a
+    /// filesystem or a process-wide environment to set up.
+    ///
+    /// Nothing here is fatal. A field that cannot be read is reported and left
+    /// at its default, because the alternative -- refusing to start -- strands
+    /// a long-running proxy over a setting it may not even use.
+    fn from_sources<K, V>(toml_text: &str, env: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        // The struct's own serialized form is the source of truth for what
+        // type each key holds, which is what lets an environment string be
+        // read as the field's type rather than guessed at from its text.
+        let template = toml::Table::try_from(Self::default()).unwrap_or_default();
+        let merged = merge_sources(toml_text, env, &template);
+
+        let mut config: Self = merged
+            .settings
+            .try_into()
+            .inspect_err(|e| error!("Failed to load config: {e}"))
+            .unwrap_or_default();
+
+        // Parsed after the rest, one at a time: a cookie the user let expire
+        // should cost them that cookie, not their whole configuration.
+        config.cookie_array = parse_each(merged.cookie_array, "cookie_array");
+        config.wasted_cookie = parse_each(merged.wasted_cookie, "wasted_cookie");
+        config
+    }
+
+    /// Loads configuration from the config file and the environment.
+    ///
+    /// Also loads cookies from a file if one was named on the command line.
     ///
     /// # Returns
     /// * Config instance
     pub fn new() -> Self {
         // Load config from TOML then override with environment variables.
-        // Use double underscore "__" to map nested keys.
-        let mut config: ClewdrConfig = Figment::from(Toml::file(CONFIG_PATH.as_path()))
-            .admerge(Env::prefixed("CLEWDR_").split("__"))
-            .extract_lossy()
-            .inspect_err(|e| {
-                error!("Failed to load config: {}", e);
-            })
-            .unwrap_or_default();
+        let toml_text = std::fs::read_to_string(CONFIG_PATH.as_path()).unwrap_or_else(|e| {
+            warn!("Could not read {}: {e}", CONFIG_PATH.display());
+            String::new()
+        });
+        // `vars_os` rather than `vars`, which panics on a variable that is not
+        // UTF-8; one such variable elsewhere in the environment is no reason
+        // to refuse to start.
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+        let mut config = Self::from_sources(&toml_text, env);
         if let Some(ref f) = Args::try_parse().ok().and_then(|a| a.file) {
             // load cookies from file
             if f.exists() {
@@ -343,9 +482,12 @@ impl ClewdrConfig {
         }
         let config = config.validate();
         if !config.no_fs {
-            let config_clone = config.to_owned();
+            let config_clone = config.clone();
+            // The pool has not started yet, so the config still holds the
+            // cookies it just loaded.
+            let cookies = config.cookies();
             spawn(async move {
-                config_clone.save().await.unwrap_or_else(|e| {
+                config_clone.save(&cookies).await.unwrap_or_else(|e| {
                     error!("Failed to save config: {}", e);
                 });
             });
@@ -386,29 +528,83 @@ impl ClewdrConfig {
         SocketAddr::new(self.ip, self.port)
     }
 
-    /// Save the configuration to a file
-    pub async fn save(&self) -> Result<(), ClewdrError> {
+    /// Renders the on-disk form: these settings with `cookies` written in.
+    ///
+    /// Whatever the config is carrying in its own cookie fields is discarded,
+    /// since the pool is the authority once it has started.
+    fn to_toml(&self, cookies: &CookieSnapshot) -> Result<String, ClewdrError> {
+        let mut to_write = self.clone();
+        to_write.cookie_array.clone_from(&cookies.cookies);
+        to_write.wasted_cookie.clone_from(&cookies.wasted);
+        Ok(toml::ser::to_string_pretty(&to_write)?)
+    }
+
+    /// The cookies this config is currently carrying.
+    ///
+    /// Only meaningful before the pool has taken ownership of them.
+    #[must_use]
+    pub fn cookies(&self) -> CookieSnapshot {
+        CookieSnapshot {
+            cookies: self.cookie_array.clone(),
+            wasted: self.wasted_cookie.clone(),
+        }
+    }
+
+    /// Moves the cookies out of this config, leaving it with none.
+    ///
+    /// Called once, when the pool starts and becomes their sole owner.
+    pub fn take_cookies(&mut self) -> CookieSnapshot {
+        CookieSnapshot {
+            cookies: std::mem::take(&mut self.cookie_array),
+            wasted: std::mem::take(&mut self.wasted_cookie),
+        }
+    }
+
+    /// Save the configuration to a file, with `cookies` written into it.
+    ///
+    /// Cookies are passed in rather than read from `self` because the pool owns
+    /// them; this is the one point where the two halves are recombined into the
+    /// on-disk format.
+    ///
+    /// The new contents go to a sibling temporary file which is flushed and
+    /// then renamed over the target, so a concurrent reader or an interrupted
+    /// run sees either the previous config or the new one, never a partial
+    /// write. Concurrent savers are serialized by [`SAVE_LOCK`].
+    ///
+    /// A no-op when running with `no_fs`.
+    ///
+    /// # Errors
+    /// If the config directory cannot be created, the config cannot be
+    /// serialized, or the file cannot be written or renamed.
+    pub async fn save(&self, cookies: &CookieSnapshot) -> Result<(), ClewdrError> {
         if self.no_fs {
             return Ok(());
         }
-        if let Some(parent) = CONFIG_PATH.parent()
+        let data = self.to_toml(cookies)?;
+        let path = CONFIG_PATH.as_path();
+
+        let _guard = SAVE_LOCK.lock().await;
+
+        if let Some(parent) = path.parent()
             && !parent.exists()
         {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let path = CONFIG_PATH.as_path();
-        let data = toml::ser::to_string_pretty(self)?;
-        tokio::fs::write(path, data).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(path, perms).await?;
+        // Sibling of the target, so the rename stays on one filesystem. The
+        // pid keeps two clewdr processes sharing a config dir off each other's
+        // temporary file; SAVE_LOCK covers savers within this process.
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let result = write_then_rename(&tmp, path, data.as_bytes()).await;
+        if result.is_err() {
+            // Best effort: a leftover temp file would otherwise linger next to
+            // the config forever.
+            drop(tokio::fs::remove_file(&tmp).await);
         }
-        Ok(())
+        result
     }
 
     /// Validate the configuration
+    #[must_use]
     pub fn validate(mut self) -> Self {
         if self.password.trim().is_empty() {
             self.password = generate_password();
@@ -416,8 +612,12 @@ impl ClewdrConfig {
         if self.admin_password.trim().is_empty() {
             self.admin_password = generate_password();
         }
-        self.cookie_array = self.cookie_array.into_iter().map(|x| x.reset()).collect();
-        self.wreq_proxy = self.proxy.to_owned().and_then(|p| {
+        self.cookie_array = self
+            .cookie_array
+            .into_iter()
+            .map(super::cookie::CookieStatus::reset)
+            .collect();
+        self.wreq_proxy = self.proxy.clone().and_then(|p| {
             Proxy::all(p)
                 .inspect_err(|e| {
                     self.proxy = None;
@@ -426,5 +626,449 @@ impl ClewdrConfig {
                 .ok()
         });
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{super::Reason, *};
+
+    /// A syntactically valid cookie, distinct per `seed`.
+    fn cookie_text(seed: char) -> String {
+        format!(
+            "sk-ant-sid01-{}-bbbbbbAA",
+            str::repeat(&seed.to_string(), 90)
+        )
+    }
+
+    fn load(toml_text: &str, env: &[(&str, &str)]) -> ClewdrConfig {
+        ClewdrConfig::from_sources(toml_text, env.iter().copied())
+    }
+
+    #[test]
+    fn settings_come_from_the_file() {
+        let config = load("port = 7777\npassword = \"filepw\"", &[]);
+
+        assert_eq!(config.port(), 7777);
+        assert_eq!(config.password(), "filepw");
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_file() {
+        let config = load(
+            "port = 7777\npassword = \"filepw\"",
+            &[("CLEWDR_PORT", "6666"), ("CLEWDR_PASSWORD", "envpw")],
+        );
+
+        assert_eq!(config.port(), 6666);
+        assert_eq!(config.password(), "envpw");
+    }
+
+    /// #157: quoting the value in a compose file locked the admin out, because
+    /// the quotes ended up in the password. Both passwords are set this way in
+    /// the wild, so both are checked here rather than only the one reported.
+    #[test]
+    fn a_quoted_password_arrives_without_its_quotes() {
+        let config = load(
+            "",
+            &[
+                ("CLEWDR_ADMIN_PASSWORD", "\"12345\""),
+                ("CLEWDR_PASSWORD", "\"abc def\""),
+            ],
+        );
+
+        assert_eq!(config.admin_password(), "12345");
+        assert_eq!(config.password(), "abc def");
+    }
+
+    /// An all-digits password used to be swallowed, leaving the user with a
+    /// generated one they had never seen. The README tells people to set this
+    /// variable, so it has to take any value they choose.
+    #[test]
+    fn a_numeric_password_is_accepted() {
+        let config = load("", &[("CLEWDR_PASSWORD", "12345")]);
+
+        assert_eq!(config.password(), "12345");
+    }
+
+    /// `CLEWDR_CHECK_UPDATE=FALSE` is set by the published container images
+    /// (the image `config.Env` in flake.nix).
+    #[test]
+    fn the_container_image_environment_is_honoured() {
+        let config = load(
+            "",
+            &[
+                ("CLEWDR_IP", "0.0.0.0"),
+                ("CLEWDR_PORT", "8484"),
+                ("CLEWDR_CHECK_UPDATE", "FALSE"),
+                ("CLEWDR_AUTO_UPDATE", "FALSE"),
+            ],
+        );
+
+        assert_eq!(config.ip().to_string(), "0.0.0.0");
+        assert_eq!(config.port(), 8484);
+        assert!(!config.check_update);
+        assert!(!config.auto_update);
+    }
+
+    /// Cookies accumulate over months and expire; one that no longer parses
+    /// used to abort the whole load, silently resetting the port and password
+    /// and generating a new admin password.
+    #[test]
+    fn one_bad_cookie_does_not_discard_the_rest_of_the_config() {
+        let toml_text = format!(
+            "port = 7777\npassword = \"filepw\"\n\
+             [[cookie_array]]\ncookie = \"{}\"\n\
+             [[cookie_array]]\ncookie = \"not-a-cookie\"\n",
+            cookie_text('a')
+        );
+
+        let config = load(&toml_text, &[]);
+
+        assert_eq!(config.port(), 7777, "the port must survive a bad cookie");
+        assert_eq!(config.password(), "filepw");
+        assert_eq!(config.cookies().cookies.len(), 1, "the good cookie is kept");
+    }
+
+    /// The environment is the only way to configure a host whose config file
+    /// cannot be edited, so a corrupt file must not silence it.
+    #[test]
+    fn the_environment_survives_a_corrupt_file() {
+        let config = load(
+            "this is not [[[ valid toml",
+            &[("CLEWDR_PASSWORD", "envpw")],
+        );
+
+        assert_eq!(config.password(), "envpw");
+    }
+
+    /// Cookies can be supplied entirely through the environment, which is how
+    /// the container and Hugging Face deployments do it.
+    #[test]
+    fn cookies_can_come_from_the_environment() {
+        let value = format!(
+            "[{{cookie=\"{}\"}},{{cookie=\"{}\"}}]",
+            cookie_text('a'),
+            cookie_text('c')
+        );
+
+        let config = load("", &[("CLEWDR_COOKIE_ARRAY", &value)]);
+
+        assert_eq!(config.cookies().cookies.len(), 2);
+    }
+
+    /// Every `Option` field is string-shaped, which is what makes the "absent
+    /// from the template means string" fallback in the loader correct. A new
+    /// `Option<u16>` would break that silently, so it is asserted here.
+    #[test]
+    fn optional_fields_are_all_settable_from_the_environment() {
+        let config = load(
+            "",
+            &[
+                ("CLEWDR_PROXY", "http://proxy.test:8080"),
+                ("CLEWDR_RPROXY", "https://rproxy.test/"),
+                ("CLEWDR_CUSTOM_H", "H"),
+                ("CLEWDR_CUSTOM_A", "A"),
+                ("CLEWDR_CUSTOM_SYSTEM", "SYS"),
+                ("CLEWDR_CLAUDE_CODE_CLIENT_ID", "cid"),
+            ],
+        );
+
+        assert_eq!(config.proxy.as_deref(), Some("http://proxy.test:8080"));
+        assert_eq!(
+            config.rproxy.as_ref().map(url::Url::as_str),
+            Some("https://rproxy.test/")
+        );
+        assert_eq!(config.custom_h.as_deref(), Some("H"));
+        assert_eq!(config.custom_a.as_deref(), Some("A"));
+        assert_eq!(config.custom_system.as_deref(), Some("SYS"));
+        assert_eq!(config.claude_code_client_id.as_deref(), Some("cid"));
+    }
+
+    /// The password is the only thing standing in front of the admin API, so
+    /// its length is a security property, not a cosmetic one.
+    #[test]
+    fn a_generated_password_has_the_advertised_length() {
+        let password = generate_password();
+        assert_eq!(password.chars().count(), PASSWORD_LENGTH);
+    }
+
+    /// Rejection sampling loops until the buffer yields enough acceptable
+    /// bytes; an off-by-one in the cutoff would let a byte outside the
+    /// alphabet through and index out of bounds, or spin forever.
+    #[test]
+    fn a_generated_password_only_uses_the_alphabet() {
+        for _ in 0..32 {
+            let password = generate_password();
+            assert!(
+                password.bytes().all(|b| PASSWORD_ALPHABET.contains(&b)),
+                "password left the alphabet: {password}"
+            );
+        }
+    }
+
+    /// The alphabet deliberately omits glyphs that are misread when a password
+    /// is copied off one screen and typed into another.
+    #[test]
+    fn the_alphabet_excludes_confusable_characters() {
+        for confusable in *b"0O1lI" {
+            assert!(
+                !PASSWORD_ALPHABET.contains(&confusable),
+                "{} is easy to misread and must not appear",
+                confusable as char
+            );
+        }
+    }
+
+    /// A generator that returned the same password twice would hand every
+    /// deployment the same admin credential.
+    #[test]
+    fn generated_passwords_differ() {
+        let first = generate_password();
+        let second = generate_password();
+        assert_ne!(first, second);
+    }
+
+    /// The point of rejecting bytes instead of folding them: across the byte
+    /// values that are kept, every character of the alphabet comes up exactly
+    /// as often as every other. Checked exhaustively rather than statistically
+    /// -- plain `byte % 56` would give the first 32 characters five byte values
+    /// each and the remaining 24 only four, and this counts that directly.
+    #[test]
+    fn every_character_is_equally_likely() {
+        use std::collections::HashMap;
+
+        let all_bytes = 0..=u8::MAX;
+        let mapped = password_from_bytes(all_bytes, usize::MAX);
+
+        let mut counts: HashMap<char, usize> = HashMap::new();
+        for c in mapped.chars() {
+            *counts.entry(c).or_default() += 1;
+        }
+
+        assert_eq!(counts.len(), PASSWORD_ALPHABET.len());
+        let per_character = PASSWORD_SAMPLE_CUTOFF / PASSWORD_ALPHABET.len();
+        for &byte in PASSWORD_ALPHABET {
+            assert_eq!(
+                counts[&(byte as char)],
+                per_character,
+                "'{}' is not equally likely",
+                byte as char
+            );
+        }
+    }
+
+    /// The bytes that would have biased the result are dropped, not reused.
+    #[test]
+    fn out_of_range_bytes_are_discarded() {
+        let rejected = (PASSWORD_SAMPLE_CUTOFF..=usize::from(u8::MAX))
+            .map(|b| u8::try_from(b).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!rejected.is_empty(), "the test needs bytes to reject");
+
+        assert_eq!(password_from_bytes(rejected.into_iter(), 64), "");
+    }
+
+    /// A run of rejections must not cut the password short; sampling continues
+    /// until the full length is reached.
+    #[test]
+    fn rejected_bytes_do_not_shorten_the_password() {
+        // One acceptable byte for every rejected one.
+        let alternating =
+            (0..u8::MAX).flat_map(|_| [u8::try_from(PASSWORD_SAMPLE_CUTOFF).unwrap(), 0u8]);
+
+        let password = password_from_bytes(alternating, PASSWORD_LENGTH);
+
+        assert_eq!(password.chars().count(), PASSWORD_LENGTH);
+        assert!(password.chars().all(|c| c == PASSWORD_ALPHABET[0] as char));
+    }
+
+    /// `main` prints the config with `println!`, and a `Display` impl that
+    /// returns `Err` makes that panic rather than fail gracefully. The URLs are
+    /// built through `http`, which rejects some inputs that look harmless --
+    /// an empty `path_and_query` among them.
+    #[test]
+    fn display_never_fails() {
+        let config = ClewdrConfig::default();
+        let rendered = config.to_string();
+        assert!(rendered.contains("Web Admin Endpoint"));
+        assert!(rendered.contains("Claude Code"));
+    }
+
+    /// A distinct, well-formed cookie per `tag`.
+    fn test_cookie(tag: char) -> CookieStatus {
+        let raw = format!(
+            "sk-ant-sid01-{}-{}AA",
+            tag.to_string().repeat(86),
+            tag.to_string().repeat(6)
+        );
+        CookieStatus::new(&raw, None).expect("valid test cookie")
+    }
+
+    /// The pool owns the cookies at runtime, so the config must hand them over
+    /// exactly once and keep none behind.
+    #[test]
+    fn take_cookies_moves_them_out() {
+        let mut config = ClewdrConfig::default();
+        config.cookie_array.insert(test_cookie('a'));
+        config
+            .wasted_cookie
+            .insert(UselessCookie::new(test_cookie('b').cookie, Reason::Null));
+
+        let taken = config.take_cookies();
+        assert_eq!(taken.cookies.len(), 1);
+        assert_eq!(taken.wasted.len(), 1);
+
+        assert!(config.cookie_array.is_empty());
+        assert!(config.wasted_cookie.is_empty());
+        // A second caller must not receive a stale duplicate.
+        let again = config.take_cookies();
+        assert!(again.cookies.is_empty() && again.wasted.is_empty());
+    }
+
+    /// Saving settings used to clobber the cookies unless the caller manually
+    /// copied them across. The written file must come from the pool's
+    /// snapshot, never from whatever the config happens to still hold.
+    #[test]
+    fn written_config_takes_cookies_from_the_snapshot() {
+        let stale = test_cookie('a');
+        let live = test_cookie('c');
+
+        let mut config = ClewdrConfig::default();
+        config.cookie_array.insert(stale.clone());
+
+        let snapshot = CookieSnapshot {
+            cookies: std::iter::once(live.clone()).collect(),
+            wasted: HashSet::new(),
+        };
+        let rendered = config.to_toml(&snapshot).expect("serialize");
+
+        assert!(
+            rendered.contains(live.cookie.to_string().trim_start_matches("sessionKey=")),
+            "the pool's cookie should be written"
+        );
+        assert!(
+            !rendered.contains(stale.cookie.to_string().trim_start_matches("sessionKey=")),
+            "the config's stale cookie should not be written"
+        );
+    }
+
+    /// Unique scratch directory, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("clewdr-test-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    /// Overwriting in place can leave the tail of a longer previous file
+    /// behind. Going through a fresh temp file plus rename must not.
+    #[tokio::test]
+    async fn write_then_rename_replaces_content_wholesale() {
+        let dir = TempDir::new("replace");
+        let dst = dir.join("clewdr.toml");
+        let tmp = dir.join("clewdr.tmp");
+
+        write_then_rename(&tmp, &dst, &b"x".repeat(4096))
+            .await
+            .expect("first write");
+        write_then_rename(&tmp, &dst, b"short")
+            .await
+            .expect("second write");
+
+        assert_eq!(std::fs::read(&dst).expect("read back"), b"short");
+        assert!(!tmp.exists(), "temp file should have been renamed away");
+    }
+
+    /// A reader must never observe a partially written config, no matter how
+    /// many savers are racing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_are_never_torn() {
+        const WRITERS: usize = 8;
+        // Large enough that a non-atomic write would be caught mid-flight.
+        const LEN: usize = 512 * 1024;
+
+        let dir = TempDir::new("torn");
+        let dst = dir.join("clewdr.toml");
+        write_then_rename(&dir.join("seed.tmp"), &dst, &vec![b'a'; LEN])
+            .await
+            .expect("seed");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = tokio::spawn({
+            let dst = dst.clone();
+            let stop = stop.clone();
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let seen = std::fs::read(&dst).expect("read during writes");
+                    // Every writer writes one repeated byte, so any mixture of
+                    // two payloads (or a truncated one) fails these checks.
+                    assert_eq!(seen.len(), LEN, "observed a partially written file");
+                    let first = seen[0];
+                    assert!(
+                        seen.iter().all(|b| *b == first),
+                        "observed a mix of two payloads"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let writers = (0..WRITERS).map(|i| {
+            let tmp = dir.join(&format!("w{i}.tmp"));
+            let dst = dst.clone();
+            tokio::spawn(async move {
+                let byte = b'a' + u8::try_from(i).expect("writer index fits");
+                for _ in 0..10 {
+                    write_then_rename(&tmp, &dst, &vec![byte; LEN])
+                        .await
+                        .expect("concurrent write");
+                }
+            })
+        });
+        for w in writers {
+            w.await.expect("writer task");
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.await.expect("reader task");
+    }
+
+    /// The config holds the admin password and cookies, so it must never be
+    /// readable by other users -- not even briefly between create and chmod.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn written_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("perms");
+        let dst = dir.join("clewdr.toml");
+        write_then_rename(&dir.join("clewdr.tmp"), &dst, b"secret")
+            .await
+            .expect("write");
+
+        let mode = std::fs::metadata(&dst).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "config should be owner read/write only"
+        );
     }
 }
