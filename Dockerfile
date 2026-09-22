@@ -4,7 +4,11 @@ RUN rustup target add wasm32-unknown-unknown && \
     curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
 # Dummy src to satisfy workspace root member
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+# Dummy xtask to satisfy workspace member list
+COPY xtask/Cargo.toml xtask/Cargo.toml
+RUN mkdir -p xtask/src && echo "fn main() {}" > xtask/src/main.rs
 COPY Cargo.toml Cargo.lock ./
+COPY anthropic-wire/ anthropic-wire/
 COPY clewdr-types/ clewdr-types/
 COPY clewdr-frontend/ clewdr-frontend/
 COPY .cargo/ .cargo/
