@@ -36,7 +36,9 @@ RUN apt-get update && apt-get install -y \
     musl-tools \
     upx-ucl \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/lib/$(uname -m)-linux-musl/libc.a /usr/lib/$(uname -m)-linux-musl/libpthread.a
+    && ln -sf /usr/lib/$(uname -m)-linux-musl/libc.a /usr/lib/$(uname -m)-linux-musl/libpthread.a \
+    && find /usr/share/cmake-*/Modules -name FindThreads.cmake -exec \
+       sed -i '1i set(CMAKE_HAVE_LIBC_PTHREAD ON CACHE BOOL "musl: pthreads in libc" FORCE)' {} \;
 
 # Determine musl target from Docker platform
 RUN case "$TARGETARCH" in \
