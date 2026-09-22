@@ -24,8 +24,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS backend-builder
 ARG TARGETARCH
+# Zig toolchain versions. Zig provides the musl C/C++ cross toolchain (musl
+# headers + libc++) that the vendored BoringSSL in btls-sys needs; the previous
+# musl-gcc + host clang++ combo linked the glibc libstdc++, which pulls
+# glibc-only symbols (__isoc23_strtoull, __sprintf_chk) that musl lacks, so the
+# final static link failed with exit 101. cargo-zigbuild drives cargo build and
+# the cmake/cc-rs C++ compiles through Zig.
+ARG ZIG_VERSION=0.16.0
+ARG CARGO_ZIGBUILD_VERSION=0.23.4
 
-# Install build dependencies + musl toolchain
+# Install build dependencies. build-essential provides the host cc/linker for
+# proc-macros and build scripts (which run on the build host); clang/libclang
+# are for bindgen; cmake/perl build BoringSSL; python3 hosts the pinned Zig.
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -33,12 +43,22 @@ RUN apt-get update && apt-get install -y \
     libclang-dev \
     perl \
     pkg-config \
-    musl-tools \
+    python3 \
+    python3-pip \
     upx-ucl \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/lib/$(uname -m)-linux-musl/libc.a /usr/lib/$(uname -m)-linux-musl/libpthread.a \
-    && find /usr/share/cmake-*/Modules -name FindThreads.cmake -exec \
-       sed -i '1i set(CMAKE_HAVE_LIBC_PTHREAD ON CACHE BOOL "musl: pthreads in libc" FORCE)' {} \;
+    && rm -rf /var/lib/apt/lists/*
+
+# Zig (pinned) as the musl C/C++ toolchain, plus cargo-zigbuild to wire it into
+# cargo, cmake and cc-rs. `zig` on PATH is what cargo-zigbuild looks for.
+RUN pip3 install --break-system-packages --no-cache-dir "ziglang==${ZIG_VERSION}" \
+    && printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > /usr/local/bin/zig \
+    && chmod +x /usr/local/bin/zig \
+    && zig version \
+    && cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
+
+# btls-sys picks the C++ runtime lib by target: for musl it defaults to
+# `stdc++` (no musl build exists), so pin it to `c++`, which Zig supplies.
+ENV BORING_BSSL_RUST_CPPLIB=c++
 
 # Determine musl target from Docker platform
 RUN case "$TARGETARCH" in \
@@ -52,8 +72,7 @@ COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies - this is the caching Docker layer.
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    CC=musl-gcc CXX=clang++ \
-    cargo chef cook --release --target "$RUST_TARGET" \
+    cargo chef cook --release --zigbuild --target "$RUST_TARGET" \
     --no-default-features --features embed-resource,xdg \
     --recipe-path recipe.json
 
@@ -61,8 +80,7 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
 COPY . .
 COPY --from=frontend-builder /build/static/ ./static
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    CC=musl-gcc CXX=clang++ \
-    cargo build --release --target "$RUST_TARGET" \
+    cargo zigbuild --release --target "$RUST_TARGET" \
     --no-default-features --features embed-resource,xdg --bin clewdr \
     && cp ./target/"$RUST_TARGET"/release/clewdr /build/clewdr \
     && upx --best --lzma /build/clewdr \
