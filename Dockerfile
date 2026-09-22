@@ -35,7 +35,8 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     musl-tools \
     upx-ucl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/lib/$(uname -m)-linux-musl/libc.a /usr/lib/$(uname -m)-linux-musl/libpthread.a
 
 # Determine musl target from Docker platform
 RUN case "$TARGETARCH" in \
